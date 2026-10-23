@@ -4799,6 +4799,17 @@ class RecoveryPage(Page):
             "几百 GB 可能要几小时，随时能停。")
         self.chk_deep.setChecked(False)
         deep_row.addWidget(self.chk_deep)
+        deep_row.addSpacing(16)
+        deep_row.addWidget(QLabel("按类型找时只找"))
+        self.cb_group = QComboBox()
+        self.cb_group.setMinimumWidth(190)
+        self.cb_group.setToolTip(
+            "只对「按文件类型找」有效。\n\n"
+            "整盘扫一遍很慢（几百 GB 要几十分钟到几小时），知道自己在找什么就缩小范围 ——\n"
+            "找照片选「照片 / 图片」，找 Office 文档选「文档 / 表格 / 幻灯片」，能快好几倍。")
+        for key, label in recovery.CARVE_GROUPS.items():
+            self.cb_group.addItem(label, key)
+        deep_row.addWidget(self.cb_group)
         deep_row.addStretch(1)
         v.addLayout(deep_row)
 
@@ -5154,7 +5165,11 @@ class RecoveryPage(Page):
             return
         # 结果都来自卷扫描（回收站条目靠 $I/$R 文件、其余靠 runs），导出统一走这条路。
         # 以前按模式分，现在只剩「能解析」和「按类型捞」两种，后者不经过这里。
-        mode = "mft"
+        #
+        # ⚠️ 这里原来写死成 mode = "mft"（4.17.0 的回归）：界面说「会自动看回收站、
+        # 已删除记录，没找到再往下深挖」，实际只扫了 MFT —— 回收站里明明躺着的文件
+        # 一个都不显示，这就是「效果不如市面工具」最直接的一条。必须走 _mode_key()。
+        mode = self._mode_key()
         target = None
         if mode == "carve":
             # 按类型找是「边找边写」，所以得先定好放哪儿
@@ -5184,7 +5199,9 @@ class RecoveryPage(Page):
             self.info.setText("正在深挖：会比平时慢很多（几百 GB 可能几小时），随时可停")
         task = self._hold(RecoveryScanTask(mode, letter, target, deep=deep,
                                           image=self._image or None,
-                                          image_base=self._image_base, parent=self))
+                                          image_base=self._image_base,
+                                          groups=[self.cb_group.currentData()],
+                                          parent=self))
         task.progress.connect(self._on_progress)
         task.failed.connect(self._on_fail)
         task.done.connect(self._on_found)
@@ -5237,13 +5254,24 @@ class RecoveryPage(Page):
             extra = ("。这块盘不是 NTFS，工具不知道哪些区域还空着，"
                      "所以抠出来的东西里可能有现在还好好放着的文件（重复品），自己挑"
                      if blind else "")
+            by_kind = stats.get("by_kind") or {}
+            detail = "、".join(
+                f"{recovery.CARVE_LABEL.get(k, k)} {v.get('n', 0)}"
+                for k, v in sorted(by_kind.items(), key=lambda kv: -kv[1].get("n", 0))[:8])
+            weak = sum(v.get("weak", 0) for v in by_kind.values())
+            tail = (f"。扫了 {stats.get('scanned', 0) / (1024 ** 3):.1f}GB，"
+                    f"{stats.get('elapsed', 0):.0f} 秒（{stats.get('speed', 0)}MB/s）")
+            if stats.get("truncated"):
+                tail += "，没扫完就停了（可以再点一次接着找别的区域）"
+            if weak:
+                tail += f"，其中 {weak} 个只找到半截（这类格式没有结束标记）"
             self.table.set_check_rows([], [])
             self.table.hide()
             self.empty.set_texts(
                 f"按文件类型找回 {len(items)} 个，已经写到你选的目录",
-                f"位置：{self._target}　名字是程序生成的（carved_0001.jpg 这种），"
-                "原文件名和目录找不回来了。扫了 "
-                f"{stats.get('scanned', 0) / (1024 ** 2):.0f}MB" + extra)
+                (f"位置：{self._target}　名字是程序起的（jpg_0001.jpg 这种），"
+                 "原文件名和目录找不回来了" + tail + ("。" + detail if detail else "")
+                 + extra))
             self.empty.show()
             self.empty.setVisible(True)
             self.info.setText(f"按类型找回 {len(items)} 个文件 → {self._target}")
@@ -5298,8 +5326,12 @@ class RecoveryPage(Page):
                 deep_txt = ("　已深挖格式化残留" if stats.get("deep_wanted")
                             else "　常规扫描没找到什么，已自动深挖")
             warn = stats.get("warn")
+            cands = stats.get("candidates") or 0
+            more = (f"　共认出 {cands} 条，这里按时间从新到旧列了 {len(items)} 条"
+                    if cands > len(items) else "")
             self.info.setText(
                 f"找到 {len(items)} 项（{'，'.join(parts)}）{deep_txt}"
+                + more
                 + (f"　⚠️ {warn}" if warn else "")
                 + ("　时间到了先停，结果不全，可以再点一次"
                    if stats.get("truncated") else ""))
@@ -5326,6 +5358,9 @@ class RecoveryPage(Page):
                 f"用上了）；只有名字 {stats.get('name_only', 0)} 项{live_txt}）{extra}")
         else:
             extra = "（扫到一半就停了，结果不全，可以再点一次）" if stats.get("truncated") else ""
+            cands = stats.get("candidates") or 0
+            if cands > len(items):
+                extra += f"（共认出 {cands} 条，这里按时间从新到旧列了 {len(items)} 条）"
             fs_txt = f"{stats['fs']}，" if stats.get("fs") else ""
             lossy = sum(1 for i in items if i.get("name_lossy"))
             lossy_txt = (f"；{lossy} 个名字的首字符是 Windows 删除时盖掉的，用 _ 占位"

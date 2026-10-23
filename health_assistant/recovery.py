@@ -15,8 +15,10 @@ r"""health_assistant.recovery — 数据恢复：先找回系统留的备份，�
    MFT 残留记录、`INDX` 目录索引、`$LogFile`/`$MFTMirr` 里的旧记录副本、
    `$UsnJrnl:$J` 变更日志（`usn_records()`，只追加，最抗覆盖）。
 5. **按文件类型找（carving）**：连残留记录都被覆盖了（或者根本不是 NTFS），扫描未分配空间，
-   靠文件头尾签名把 JPEG/PNG/PDF/ZIP/MP4 抠出来 —— 见 `carve()`。
-   代价：**文件名和目录找不回来**，且可能不完整。
+   靠文件头 + 完整结构走完整个文件 —— 见 `carving.py` / `carve()`。
+   现在认 23 类（照片/文档/表格/幻灯片/压缩包/视频/音频/数据库/程序/PSD/RTF…），
+   默认扫**整个未分配区**、能跨读块切几十 GB 的大文件。
+   代价：**文件名和目录找不回来**，碎片化的文件仍可能只有半截。
 
 另外两件配套的事：
 
@@ -53,6 +55,8 @@ import struct
 import subprocess
 import time
 
+from . import carving as _carving
+
 __all__ = [
     "RecoverError", "volumes", "same_volume", "check_target",
     "NtfsVolume", "ImageVolume", "scan_deleted", "recover_one", "carve",
@@ -62,7 +66,7 @@ __all__ = [
     "image_plan", "smart_preflight", "badmap_path",
     "probe_volume", "boot_kind", "boot_hint", "boot_label", "open_volume",
     "BareVolume",
-    "CONFIDENCE", "CARVE_KINDS", "CARVE_LABEL",
+    "CONFIDENCE", "CARVE_KINDS", "CARVE_LABEL", "CARVE_GROUPS",
 ]
 
 SECTOR = 512
@@ -118,9 +122,9 @@ _TEXT_EXTS = {"txt", "md", "csv", "tsv", "json", "xml", "ini", "log", "py",
 _FTYP_EXTS = {"mp4", "mov", "m4a", "m4v", "3gp", "heic"}
 
 # carving 支持的类型：能靠头尾签名切出边界的那几种
-CARVE_KINDS = ("jpg", "png", "pdf", "zip", "mp4")
-CARVE_LABEL = {"jpg": "照片 JPEG", "png": "图片 PNG", "pdf": "PDF",
-               "zip": "压缩包/Office 文档", "mp4": "视频 MP4/MOV"}
+CARVE_KINDS = _carving.KIND_IDS
+CARVE_LABEL = _carving.KIND_LABEL
+CARVE_GROUPS = _carving.GROUPS
 
 
 class RecoverError(Exception):
@@ -1310,7 +1314,8 @@ class ImageVolume(NtfsVolume):
 
 # ───────────────────────── 扫描已删除文件 ─────────────────────────
 
-def scan_deleted(vol, limit=2000, budget=None, progress=None, cancel=None):
+def scan_deleted(vol, limit=2000, budget=None, progress=None, cancel=None,
+                 progress2=None):
     """扫 MFT（NTFS）或目录树（FAT/exFAT），列出已删除的文件/文件夹（**只读**）。
 
     `vol` 可以是盘符（'C:'）也可以是已经打开的卷对象。
@@ -1432,8 +1437,14 @@ def scan_deleted(vol, limit=2000, budget=None, progress=None, cancel=None):
         keep = cands[:max(limit, 200)]
         order = {"good": 0, "dir": 1, "risky": 2, "compressed": 3, "encrypted": 4,
                  "no_data": 5}
-        for it in keep:
+        # 逐个核对「内容还在不在」要读盘（每条抽 4 段），2 万条要十几秒 ——
+        # 这段时间不报进度的话，界面看起来就是卡死了。
+        for i, it in enumerate(keep):
             it["confidence"] = _confidence(v, it)
+            if progress2 and i % 256 == 0:
+                progress2(i, len(keep))
+        if progress2:
+            progress2(len(keep), len(keep))
         keep.sort(key=lambda c: (order.get(c["confidence"], 9), -c["_t"]))
         items = keep[:limit]
 
@@ -2733,177 +2744,51 @@ def metadata_scan(letter, budget=None, limit=3000, progress=None, cancel=None,
 
 # ───────────────────────── 按文件类型找（carving） ─────────────────────────
 
-def _find(hay, needle, start=0, end=None):
-    idx = hay.find(needle, start, end)
-    return idx
+# ───────────────────────── 按文件类型找（carving）─────────────────────────
+# 真正的实现在 `carving.py`：23 类签名 / 结构校验 / 跨块切片 / 全盘扫描。
+# 这里只留一层兼容包装 —— 老的调用方式（kinds / budget_bytes / max_file / max_files）
+# 继续有效，但默认值全改了：以前默认只扫前 512MB、只写 120 个文件，等于没扫。
+_KIND_ALIAS = {"jpg": "jpeg", "jpe": "jpeg", "tif": "tiff", "doc": "cfb", "xls": "cfb",
+               "ppt": "cfb", "msi": "cfb", "docx": "zip", "xlsx": "zip", "pptx": "zip",
+               "mov": "mp4", "heic": "mp4", "avi": "riff", "wav": "riff", "webp": "riff",
+               "gz": "gzip", "db": "sqlite", "exe": "exe", "dll": "exe"}
 
 
-def _end_jpg(buf, start):
-    """JPEG：从 FF D8 FF 开始，找 FF D9（顺带跳过 FF D0-D7 这种段内标记）。"""
-    i = start + 3
-    n = len(buf)
-    while i + 1 < n:
-        if buf[i] == 0xFF:
-            m = buf[i + 1]
-            if m == 0xD9:
-                return i + 2
-            if m == 0x00 or 0xD0 <= m <= 0xD7 or m == 0xFF:
-                i += 1 if m == 0xFF else 2
-                continue
-            if i + 4 <= n:
-                seg = struct.unpack_from(">H", buf, i + 2)[0]
-                i += 2 + seg
-                continue
-        i += 1
-    return -1
-
-
-def _end_png(buf, start):
-    i = buf.find(b"IEND", start)
-    return i + 8 if i > 0 else -1
-
-
-def _end_pdf(buf, start):
-    i = buf.find(b"%%EOF", start)
-    if i < 0:
-        return -1
-    return min(len(buf), i + 5 + 2)
-
-
-def _end_zip(buf, start):
-    """ZIP/Office：找中央目录结束标记 EOCD，文件长度 = 位置 + 22（注释按长度补）。"""
-    i = buf.find(b"PK\x05\x06", start + 4)
-    if i < 0:
-        return -1
-    if i + 22 <= len(buf):
-        comment = struct.unpack_from("<H", buf, i + 20)[0]
-        return min(len(buf), i + 22 + comment)
-    return min(len(buf), i + 22)
-
-
-def _end_mp4(buf, start):
-    """MP4/MOV：按 box 一路走（size 4 字节大端 + 类型 4 字节），走到不合理的长度就收。"""
-    pos = start
-    n = len(buf)
-    while pos + 8 <= n:
-        size = struct.unpack_from(">I", buf, pos)[0]
-        if size == 1 and pos + 16 <= n:
-            size = struct.unpack_from(">Q", buf, pos + 8)[0]
-        elif size == 0:
-            return -1
-        if size < 8 or pos + size > n:
-            return -1
-        pos += size
-    return pos if pos > start else -1
-
-
-_SIGS = {
-    "jpg": (b"\xff\xd8\xff", _end_jpg),
-    "png": (b"\x89PNG\r\n\x1a\n", _end_png),
-    "pdf": (b"%PDF-", _end_pdf),
-    "zip": (b"PK\x03\x04", _end_zip),
-    "mp4": (None, _end_mp4),          # 特殊：要校验 [4:8] == 'ftyp'
-}
-
-
-def carve(vol, out_dir, kinds=CARVE_KINDS, budget_bytes=512 << 20,
-          max_file=64 << 20, max_files=120, progress=None, cancel=None):
-    """在未分配空间里按文件类型找（carving）。
+def carve(vol, out_dir, kinds=None, budget_bytes=None, max_file=None,
+          max_files=5000, progress=None, cancel=None, groups=None, min_size=None):
+    """在未分配空间里按文件类型找（carving），直接写到 `out_dir`。
 
     **只在目录区也没了的时候用**：格式化、分区表坏、MFT 被清、甚至根本不是 NTFS。
-    找回的是「文件内容」，原文件名和目录结构找不回来，也不保证每个都完整。
-    扫描范围默认前 512MB 未分配空间（可调），避免「一点就扫一整天」。
+    找回的是「文件内容」，原文件名和目录找不回来。
 
-    4.13.0 起 non-NTFS 也能用：不传 NTFS 卷时先按 NTFS 打开，打不开就退成
-    `BareVolume`（裸卷视图）。代价是**不知道哪些簇还空着**（`cluster_used()` 返回
-    None），所以从活文件里也可能抠出重复品 —— 这一点会在统计里如实标出来（`blind`）。
+    和 4.17 以前的区别（都是实测出来的差距）：
+    * 从 5 种格式扩到 23 类 / 30 多种扩展名，而且**按结构走到文件尾**，
+      不再「看到文件头就当找到、切出来一半」；
+    * 默认扫**整个未分配区**（不是前 512MB），可以随时停，进度条按字节走；
+    * 结果默认最多 5000 个（以前 120 个），同内容只留一份；
+    * 每个结果都带 verdict：结构完整走到尾的算 ok，只能走到「结构不再自洽」的算 weak。
+
+    `groups` 可按大类缩小范围：photo/doc/media/archive/other（只扫需要的类更快）。
     """
-    # 已经打开的卷对象（NTFS / FAT / exFAT / 裸卷）直接用；传盘符才在这里开
+    from . import carving
     from .fatfs import is_fat
     own = not isinstance(vol, (NtfsVolume, BareVolume)) and not is_fat(vol)
     v = open_volume(vol)[0] if own else vol
-    os.makedirs(out_dir, exist_ok=True)
-    kinds = tuple(k for k in kinds if k in CARVE_KINDS)
-    chunk_size = 4 << 20
-    step_back = 64 << 10                  # 块边界可能切开签名，往回退一点再判
-    pos = 0
-    found = []
-    scanned = 0
-    cluster = v.cluster
-    total_disk = v.total_sectors * v.bytes_per_sector
-    # 注意：BareVolume 的 cluster_used() 恒返回 None（它就是不知道哪些簇还空着），
-    # 所以下面「跳过活文件占用区」那一句对它不生效 —— 这正是要如实标 blind 的原因。
-    while pos < total_disk and scanned < budget_bytes:
-        if cancel and cancel():
-            break
-        chunk = v.read(pos, chunk_size)
-        if not chunk:
-            break
-        scanned += len(chunk)
-        progress and (progress(min(scanned, budget_bytes), budget_bytes, len(found)))
-        base = pos
-        for kind in kinds:
-            if kind == "mp4":
-                i = 0
-                while True:
-                    i = chunk.find(b"ftyp", i + 1)
-                    if i < 4:
-                        if i < 0:
-                            break
-                        continue
-                    start = i - 4
-                    lcn = (base + start) // cluster
-                    if v.cluster_used(lcn):
-                        continue           # 这块还被活着的文件占着，不是「可捡的碎片」
-                    end = _end_mp4(chunk, start)
-                    if end > start + 16:
-                        found.append((kind, base + start, end - start))
-                    i = end if end > 0 else i + 8
-                continue
-            sig, end_fn = _SIGS[kind]
-            i = 0
-            while True:
-                i = _find(chunk, sig, i + 1)
-                if i < 0:
-                    break
-                lcn = (base + i) // cluster
-                if v.cluster_used(lcn):
-                    continue
-                end = end_fn(chunk, i)
-                if end > i + 8 and end - i <= max_file:
-                    found.append((kind, base + i, end - i))
-                i += 8
-        pos += chunk_size - step_back
-        if len(found) >= max_files * 3:
-            break
-
-    # 落盘：逐个读出来写文件（跨块的用卷整体读，避免边界丢字节）
-    made = []
-    for kind, start, length in found[:max_files]:
-        if cancel and cancel():
-            break
-        name = f"carved_{len(made) + 1:04d}.{kind}"
-        dest = _unique_path(os.path.join(out_dir, name))
-        try:
-            with open(dest, "wb") as fh:
-                left = length
-                p = start
-                while left > 0:
-                    step = min(left, 1 << 20)
-                    buf = v.read(p, step)
-                    if not buf:
-                        break
-                    fh.write(buf)
-                    p += len(buf)
-                    left -= len(buf)
-            made.append(dest)
-        except OSError:
-            break
-    if own:
-        v.close()
-    return made, {"scanned": scanned, "budget": budget_bytes, "kinds": list(kinds),
-                  "blind": isinstance(v, BareVolume),
-                  "fs": getattr(v, "kind", "ntfs")}
+    ids = None
+    if kinds:
+        ids = []
+        for k in kinds:
+            k = _KIND_ALIAS.get(str(k).lower().lstrip("."), str(k).lower().lstrip("."))
+            if k in carving.KINDS and k not in ids:
+                ids.append(k)
+    try:
+        return carving.carve(v, out_dir, kinds=ids, groups=groups,
+                             budget_bytes=budget_bytes, max_file=max_file,
+                             max_files=max_files, min_size=min_size,
+                             progress=progress, cancel=cancel)
+    finally:
+        if own:
+            v.close()
 
 
 # ───────────────────────── 卷影副本（「以前的版本」）─────────────────────────

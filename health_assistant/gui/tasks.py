@@ -526,7 +526,7 @@ class RecoveryScanTask(BaseTask):
     done = Signal(object)
 
     def __init__(self, mode, letter, target=None, budget=None, deep=False,
-                 image=None, image_base=0, parent=None):
+                 image=None, image_base=0, groups=None, parent=None):
         super().__init__(parent)
         self.mode = mode
         self.letter = letter
@@ -535,6 +535,7 @@ class RecoveryScanTask(BaseTask):
         self.deep = deep                # 整卷扫描（连已分配区域也扫，慢）
         self.image = image              # 有值就扫这份镜像，不再碰源盘
         self.image_base = image_base    # 整盘镜像里卷首的字节偏移（0 = 从文件头开始）
+        self.groups = groups            # 按类型找时只找这些大类（None = 全部）
         self._stop = False
 
     def stop(self):
@@ -610,13 +611,16 @@ class RecoveryScanTask(BaseTask):
             self.progress.emit(0, 3, "第 2 步 / 3：扫磁盘上的已删除记录…")
             try:
                 items2, st2 = recovery.scan_deleted(
-                    src, limit=3000,
+                    src, limit=20000,
                     progress=lambda i, n: None if self._stop else self.progress.emit(
                         i, max(n, 1), "第 2 步 / 3：正在扫已删除记录…"),
+                    progress2=lambda i, n: None if self._stop else self.progress.emit(
+                        i, max(n, 1), "第 2 步 / 3：正在逐个确认内容还在不在…"),
                     cancel=self.stopped)
             except Exception as exc:               # noqa: BLE001
-                self.failed.emit(f"扫已删除记录失败：{exc}")
-                return
+                # 这一步失败（多半是没管理员权限 / 文件系统认不出）不该把第 1 步
+                # 已经拿到的回收站结果一起扔掉 —— 记下原因，接着走。
+                out.setdefault("notes", []).append(f"扫已删除记录没做成：{exc}")
             stages.append(("已删除记录", take(items2, "deleted")))
 
         # ── 第 3 步：格式化残留（只在「几乎没找到」或用户要求时）──
@@ -633,8 +637,7 @@ class RecoveryScanTask(BaseTask):
                         i, max(n, 1), "第 3 步 / 3：正在深挖格式化残留…"),
                     cancel=self.stopped)
             except Exception as exc:               # noqa: BLE001
-                self.failed.emit(f"深挖格式化残留失败：{exc}")
-                return
+                out.setdefault("notes", []).append(f"深挖格式化残留没做成：{exc}")
             stages.append(("格式化残留", take(items3, "residual")))
 
         order = {"recycle": 0, "good": 1, "dir": 2, "risky": 3,
@@ -653,6 +656,9 @@ class RecoveryScanTask(BaseTask):
             "letter": self.letter,
             "fs": st2.get("fs") or st3.get("fs") or "",
             "truncated": bool(st2.get("truncated") or st3.get("truncated")),
+            # 「认出来多少条」和「列出多少条」是两件事：2 万条上限是为了界面不卡，
+            # 但不能让用户以为只有这么多 —— 界面会写「共认出 N 条，这里列 M 条」。
+            "candidates": st2.get("candidates") or st3.get("candidates") or 0,
             "elapsed": round(time.time() - t0, 1),
             "fs_label": getattr(src, "fs", "") or "",
         }
@@ -667,9 +673,11 @@ class RecoveryScanTask(BaseTask):
             out["stats"] = {"found": len(out["items"])}
         elif self.mode == "mft":
             items, st = recovery.scan_deleted(
-                src, limit=3000,
+                src, limit=20000,
                 progress=lambda i, n: None if self._stop else self.progress.emit(
                     i, n, "正在扫磁盘上的已删除记录…"),
+                progress2=lambda i, n: None if self._stop else self.progress.emit(
+                    i, max(n, 1), "正在逐个确认内容还在不在…"),
                 cancel=self.stopped)
             out["items"] = items
             out["stats"] = st
@@ -686,11 +694,17 @@ class RecoveryScanTask(BaseTask):
             out["items"] = items
             out["stats"] = st
         elif self.mode == "carve":
+            def _stage(done, total, found):
+                if self._stop:
+                    return
+                gb = done / (1024 ** 3)
+                all_gb = total / (1024 ** 3)
+                self.progress.emit(
+                    done, total,
+                    f"正在按文件类型找…已扫 {gb:.1f} / {all_gb:.1f}GB，找到 {found} 个")
             made, st = recovery.carve(
-                src, self.target,
-                progress=lambda done, total, found: None if self._stop else
-                self.progress.emit(done, total, "正在按文件类型找…"),
-                cancel=self.stopped)
+                src, self.target, groups=self.groups,
+                progress=_stage, cancel=self.stopped)
             out["items"] = [{"name": os.path.basename(m), "path": m,
                              "size": os.path.getsize(m) if os.path.exists(m) else 0,
                              "confidence": "good", "mtime": "", "is_dir": False}
