@@ -1,0 +1,11 @@
+# 源码统一 LF，跨平台
+* text=auto eol=lf
+
+# cmd/bat 必须是 CRLF，否则在 Windows 上解析会串行
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# 二进制
+*.ico binary
+*.exe binary
+*.png binary
