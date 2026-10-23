@@ -4692,14 +4692,6 @@ class RecoveryPage(Page):
       · 不承诺都能恢复（SSD 开了 TRIM、簇已被新文件占用、加密/压缩的都可能不行）。
     """
 
-    MODES = (
-        ("recycle", "① 回收站里还在的", "最稳：文件没被动过，原名和原位置都在"),
-        ("mft", "② 已删除的文件", "回收站清空了用这个：从当前文件系统的记录里找名字和内容"),
-        ("raw", "③ 格式化后的残留", "整块盘被格式化、目录没了：扫盘上残留的旧记录和目录索引，"
-                                  "慢一些，但能带回原来的文件名和目录"),
-        ("carve", "④ 按文件类型找", "连残留记录都没了才用：只认文件内容，找不回名字"),
-    )
-
     def __init__(self, cfg, parent=None):
         super().__init__(cfg, parent)
         self._items = []
@@ -4775,21 +4767,12 @@ class RecoveryPage(Page):
         img_row.addWidget(self.lb_src, 1)
         v.addLayout(img_row)
 
-        modes = QHBoxLayout()
-        modes.setSpacing(14)
-        self._group = QButtonGroup(self)
-        for i, (key, label, hint) in enumerate(self.MODES):
-            rb = QRadioButton(label)
-            rb.setToolTip(hint)
-            rb.setChecked(i == 0)
-            rb.mode_key = key
-            rb.toggled.connect(self._sync_hint)          # 换模式时把下面那行说明换掉
-            self._group.addButton(rb, i)
-            modes.addWidget(rb)
-        modes.addStretch(1)
-        v.addLayout(modes)
-
-        self.lb_hint = QLabel(self.MODES[0][2])
+        # 这里原来有 4 个单选：「① 回收站 / ② 已删除 / ③ 格式化残留 / ④ 按类型找」。
+        # 全砍了 —— 用户既不知道也不记得文件是怎么没的（"我清空过回收站吗？"），
+        # 让他先做这道选择题，等于把程序该做的判断推给他。
+        # 现在只有一个按钮：点下去后台按「回收站 → 已删除记录 →（必要时）格式化残留」
+        # 自动跑一遍，结果合并去重。用户只需要选盘、点按钮。
+        self.lb_hint = QLabel("选好盘，点「开始查找」")
         self.lb_hint.setObjectName("Faint")
         self.lb_hint.setWordWrap(True)
         self.lb_hint.setMinimumHeight(18)
@@ -4808,14 +4791,13 @@ class RecoveryPage(Page):
 
         deep_row = QHBoxLayout()
         deep_row.setSpacing(8)
-        self.chk_deep = QCheckBox("整卷扫描（慢，但更全）")
+        self.chk_deep = QCheckBox("找得更彻底（慢）")
         self.chk_deep.setToolTip(
-            "连「现在还有文件占着」的区域也一起扫。专业恢复公司就是这么干的："
-            "先把盘整个镜像下来，再对镜像慢扫几小时到几天 —— 所以旧记录哪怕正好落在"
-            "新文件的占用区里也能被翻出来。\n"
-            "默认只扫空闲区：快，但会漏掉这种情况。整卷扫几百 GB 可能要几小时，随时能停。")
+            "勾上就一定会深挖「格式化后的残留」，而且连现在还有文件占着的区域也一起扫。\n\n"
+            "什么时候勾：这块盘被格式化过、或者数据特别重要、上面找出来的东西不像是你要的。\n"
+            "不勾也会自动判断 —— 常规扫描几乎没找到东西时，程序会自己往下深挖。\n"
+            "几百 GB 可能要几小时，随时能停。")
         self.chk_deep.setChecked(False)
-        self.chk_deep.setEnabled(False)          # 只有 ③ 用得上
         deep_row.addWidget(self.chk_deep)
         deep_row.addStretch(1)
         v.addLayout(deep_row)
@@ -4920,9 +4902,11 @@ class RecoveryPage(Page):
         self.tree.hide()
         v.addWidget(self.tree, 1)
 
-        self.empty = EmptyState("这里会列出找到的东西",
-                                "先在上面选一块盘，点「开始查找」。刚删掉的东西先看①回收站，"
-                                "回收站清空了再用②；格式化了才用③")
+        self.empty = EmptyState(
+            "这里会列出找到的东西",
+            "先在上面选一块盘，点「开始查找」—— 刚删的、回收站清空的、格式化的，都是同一个按钮，"
+            "程序会按「回收站 → 已删除记录 → 格式化残留」自己找一遍。\n"
+            "找出来的东西勾上，点右下角「恢复到…」存到另一块盘。")
         v.addWidget(self.empty, 1)
         return box
 
@@ -5078,67 +5062,48 @@ class RecoveryPage(Page):
     _CAN_SCAN = ("ntfs", "exfat", "fat32", "fat")
 
     def _apply_fs(self, kind, hint=""):
-        """按「这块盘是什么格式」把用不上的方式灰掉，并把原因摆出来。"""
+        """只调提示文字和按钮状态。
+
+        以前这里要把 4 个「方式」单选按格式灰掉，现在方式没了 —— 逻辑简化成：
+        加密盘直接拦住；其余都是「点按钮就行」，只是措辞不同。
+        """
         self._fs_kind = kind or ""
         self._fs_hint = hint or ""
         kind = self._fs_kind
         if kind == "bitlocker":
-            # 四种方式全都用不上：连「选中」都不该留着 —— 留一个灰着的选中项，
-            # 看起来像「这个还能点」，其实点不动。
-            self._group.setExclusive(False)
-            for b in self._group.buttons():
-                b.setEnabled(False)
-                b.setChecked(False)
-            self._group.setExclusive(True)
             self.chk_deep.setEnabled(False)
             self.chk_deep.setChecked(False)
             self.btn_scan.setEnabled(False)     # 加密盘扫了也只有密文，别让人白等
-            self.lb_hint.setText("这块盘是加密的：先解锁，再回来扫"
-                                 "（怎么解锁看右边「为什么？」）")
+            self.lb_hint.setText("这块盘是加密的：先解锁，再回来找"
+                                 "（怎么解锁点右边「为什么？」）")
             self.btn_why.show()
             return
         self.btn_scan.setEnabled(True)
-        if kind in ("exfat", "fat32", "fat"):
-            # FAT 系没有 MFT：③「格式化后的残留」扫的是 NTFS 记录表，用不上；
-            # 但 ②「已删除的文件」现在支持了（走目录项），别一起灰掉。
-            for b in self._group.buttons():
-                b.setEnabled(b.mode_key != "raw")
-            if self._mode_key() == "raw":        # 停在一个用不了的方式上，挪到 ②
-                for b in self._group.buttons():
-                    if b.mode_key == "mft":
-                        b.setChecked(True)
-                        break
-            self.lb_hint.setText(
-                f"这块盘是 {recovery.boot_label(kind)} 格式：用 ②「已删除的文件」找"
-                "删掉的东西，③「格式化后的残留」只对 NTFS 有效，这里用不了")
-            self.btn_why.show()
-            return
+        self.chk_deep.setEnabled(True)
         if kind in self._ONLY_CARVE:
-            for b in self._group.buttons():
-                b.setEnabled(b.mode_key == "carve")
-            for b in self._group.buttons():
-                if b.mode_key == "carve" and not b.isChecked():
-                    b.setChecked(True)
-                    break
+            self.btn_scan.setText("按文件类型找")
             self.lb_hint.setText(
-                f"这块盘是 {recovery.boot_label(kind)} 格式：①②③ 读的是 NTFS 的记录表，"
-                "这里只有「④ 按文件类型找」能用（只认内容，找不回原名）")
-            self.btn_why.show()
-            return
-        for b in self._group.buttons():
-            b.setEnabled(True)
-        if self._group.checkedButton() is None:
-            # 上一块盘是 BitLocker，被清成「一个都没选」；换回 NTFS 盘得给个默认项，
-            # 否则界面上看不到任何选中、点「开始查找」却按①跑，说不清用的哪种方式。
-            first = self._group.button(0)
-            if first is not None:
-                first.setChecked(True)
-        self._sync_hint()
-        if kind == "unknown":
-            self.lb_hint.setText("这块盘的格式认不出来 —— 先试「④ 按文件类型找」更靠谱")
-            self.btn_why.show()
+                f"这块盘是 {recovery.boot_label(kind)} 格式：文件名和目录都读不出来，"
+                "只能按内容捞（找回的放到目标目录，名字是程序起的）")
+        elif kind in ("exfat", "fat32", "fat"):
+            self.btn_scan.setText("开始查找")
+            self.lb_hint.setText(
+                f"这块盘是 {recovery.boot_label(kind)} 格式：点「开始查找」就行 —— "
+                "会自动看回收站和已删除的文件（FAT 系的名字首字符可能是 _）")
+        elif kind == "ntfs":
+            self.btn_scan.setText("开始查找")
+            self.lb_hint.setText("点「开始查找」就行 —— 会自动看回收站、已删除的记录，"
+                                 "没找到再往下深挖")
+        elif kind == "unknown":
+            self.btn_scan.setText("按文件类型找")
+            self.lb_hint.setText("这块盘的格式认不出来 —— 只能按内容捞，找不回原来的名字")
         else:
+            self.btn_scan.setText("开始查找")
+            self.lb_hint.setText("点「开始查找」就行")
+        if kind == "ntfs":
             self.btn_why.hide()
+        else:
+            self.btn_why.show()
 
     def _show_fs_why(self):
         if not self._fs_hint:
@@ -5164,26 +5129,21 @@ class RecoveryPage(Page):
             return "unknown"
         return recovery.boot_kind(head, ext)
 
-    def _sync_hint(self):
-        rb = self._group.checkedButton()
-        if rb is not None:
-            key = rb.mode_key
-            for k, _l, hint in self.MODES:
-                if k == key:
-                    self.lb_hint.setText(hint)
-                    self._mode = key
-                    break
-            # 「整卷扫描」只有 ③ 有意义：①② 读的是活的文件系统，④ 本来就是逐扇区扫
-            self.chk_deep.setEnabled(key == "raw")
-            if key != "raw":
-                self.chk_deep.setChecked(False)
-
     # ───────────── 查找 ─────────────
     def _mode_key(self):
-        rb = self._group.checkedButton()
-        return rb.mode_key if rb is not None else "recycle"
+        """现在只有两种可能：能解析就自动找，解析不了就只能按文件类型捞。
+
+        「回收站 / 已删除 / 格式化残留」的区分已经交给 `RecoveryScanTask(mode="auto")`，
+        界面上不再让人选。
+        """
+        return "carve" if self._fs_kind in self._ONLY_CARVE else "auto"
 
     def start_scan(self):
+        """一个按钮干完所有事。
+
+        不再问「文件是进回收站了、删了、还是格式化了」—— 用户不记得，也不该被问。
+        后台按「回收站 → 已删除记录 →（必要时）格式化残留」自动跑，结果合并去重。
+        """
         if self.is_busy():
             return
         letter = self._letter
@@ -5192,16 +5152,9 @@ class RecoveryPage(Page):
         if not letter:
             QMessageBox.information(self, "先选一块盘", "上面选一下要恢复哪块盘")
             return
-        mode = self._mode_key()
-        if self._image and mode == "recycle":
-            # 回收站是「当前系统」的概念，镜像文件里没有它 —— 直接说清楚，
-            # 否则用户会以为镜像里也能看到回收站
-            QMessageBox.information(
-                self, "回收站要用盘符",
-                "扫描镜像时不看回收站（回收站属于当前系统，不在镜像文件里）。\n\n"
-                "想看回收站：把上面「哪块盘」选回真实盘符；\n"
-                "想找镜像里的东西：选 ②/③/④ 其中一种。")
-            return
+        # 结果都来自卷扫描（回收站条目靠 $I/$R 文件、其余靠 runs），导出统一走这条路。
+        # 以前按模式分，现在只剩「能解析」和「按类型捞」两种，后者不经过这里。
+        mode = "mft"
         target = None
         if mode == "carve":
             # 按类型找是「边找边写」，所以得先定好放哪儿
@@ -5209,13 +5162,11 @@ class RecoveryPage(Page):
             if not target:
                 return
             self._target = target
-        if mode in ("mft", "raw", "carve") and not is_admin() and not self._image:
-            QMessageBox.warning(
-                self, "需要管理员权限",
-                "读磁盘上「已删除」的原始数据需要管理员权限。\n\n"
-                "请关掉工具，右键「以管理员身份运行」再试。\n"
-                "（① 回收站那条路不需要管理员。）")
-            return
+        deep = bool(self.chk_deep.isChecked())
+        if mode in ("auto", "mft", "raw") and not is_admin() and not self._image:
+            # 不硬拦：非管理员也还能看回收站（第一步），只是扫不到已删除记录。
+            # 与其让人卡在一个看不懂的「需要管理员权限」弹窗，不如跑一遍再告诉他。
+            self.info.setText("没有管理员权限：这次只有回收站能看")
 
         from .tasks import RecoveryScanTask
         self.btn_scan.setEnabled(False)
@@ -5223,10 +5174,14 @@ class RecoveryPage(Page):
         self.btn_restore.setEnabled(False)
         self.pb.setRange(0, 0)
         self.pb.show()
-        self.info.setText("正在查找…")
-        deep = bool(self.chk_deep.isChecked() and mode == "raw")
+        if mode == "auto":
+            self.info.setText("正在查找（会自动看回收站、已删除记录）…")
+        elif mode == "carve":
+            self.info.setText("正在按文件类型找…")
+        else:
+            self.info.setText("正在查找…")
         if deep:
-            self.info.setText("整卷扫描已开始：会比平时慢很多（几百 GB 可能几小时），随时可停")
+            self.info.setText("正在深挖：会比平时慢很多（几百 GB 可能几小时），随时可停")
         task = self._hold(RecoveryScanTask(mode, letter, target, deep=deep,
                                           image=self._image or None,
                                           image_base=self._image_base, parent=self))
@@ -5253,9 +5208,9 @@ class RecoveryPage(Page):
     def _on_fail(self, msg):
         self.info.setText("查找失败：" + msg.splitlines()[-1])
         tail = ""
-        if self._mode_key() == "raw" and "NTFS" in msg:
-            tail = ("\n\n这块盘现在不是 NTFS（可能格式化成 exFAT/FAT 了），读不到旧的文件记录。\n"
-                    "换④「按文件类型找」——它不看文件系统，只按内容找。")
+        if "NTFS" in msg or "不是 FAT" in msg:
+            tail = ("\n\n这块盘的文件系统跟预期对不上（可能被格式化过、或者是加密盘）。\n"
+                    "可以试「按文件类型找」——它不看文件系统，只按内容找（找不回原名）。")
         QMessageBox.warning(self, "查找失败", msg + tail)
 
     def _on_finished(self):
@@ -5309,10 +5264,7 @@ class RecoveryPage(Page):
         self.table.setVisible(bool(items))
         self.empty.setVisible(not items)
         if not items:
-            if mode == "recycle":
-                self.empty.set_texts("回收站里没有能还原的东西",
-                                     "回收站可能已经清空了。换②「已删除的文件」再找一遍")
-            elif (stats.get("zero") or {}).get("verdict") in ("zeros", "erased",
+            if (stats.get("zero") or {}).get("verdict") in ("zeros", "erased",
                                                               "mostly_zeros"):
                 z = stats["zero"]
                 ratio = max(z.get("zero_ratio") or 0, z.get("ff_ratio") or 0)
@@ -5323,13 +5275,35 @@ class RecoveryPage(Page):
                     f"{ratio * 100:.1f}% 是 {kind}。\n"
                     "这说明释放过的块已经被擦掉了（SSD 的 TRIM 真落地到闪存就是这样），"
                     "软件层面读不回来，换什么工具都一样。\n"
-                    "还能救的是「名字」：勾上整卷扫描再试，变更日志里往往还留着文件名。")
+                    "还能救的是「名字」：勾上「找得更彻底」再试，变更日志里往往还留着文件名。")
             else:
-                self.empty.set_texts("没找到可恢复的记录",
-                                     "先试③「格式化后的残留」——它能带回原文件名；"
-                                     "还是没有就换④「按文件类型找」。"
-                                     "如果这块盘是 SSD 且被 TRIM 过，数据在物理层面已经没了")
-        if mode == "recycle":
+                hint = ("已经自动看过回收站、已删除记录"
+                        + ("，也深挖了格式化残留" if stats.get("deep_ran") else "")
+                        + "。")
+                self.empty.set_texts(
+                    "这块盘上没找到可恢复的记录",
+                    hint + "\n\n还能试的：勾上「找得更彻底」再找我一遍；"
+                    "或者用上面的「按文件类型找」按内容硬捞（找不回原名）。\n"
+                    "如果这块盘是 SSD 且被 TRIM 过，数据在物理层面已经没了。")
+        if mode == "auto":
+            stages = stats.get("stages") or []
+            parts = [f"{name} {n} 项" for name, n in stages if n]
+            if not items:
+                # 空结果时别写「找到 0 项（共 0 项）」这种绕的话，大白话说清就行
+                self.info.setText("已经找过一遍，没有结果"
+                                  + (f"（{'，'.join(parts)}）" if parts else ""))
+                return
+            deep_txt = ""
+            if stats.get("deep_ran"):
+                deep_txt = ("　已深挖格式化残留" if stats.get("deep_wanted")
+                            else "　常规扫描没找到什么，已自动深挖")
+            warn = stats.get("warn")
+            self.info.setText(
+                f"找到 {len(items)} 项（{'，'.join(parts)}）{deep_txt}"
+                + (f"　⚠️ {warn}" if warn else "")
+                + ("　时间到了先停，结果不全，可以再点一次"
+                   if stats.get("truncated") else ""))
+        elif mode == "recycle":
             self.info.setText(f"回收站里 {len(items)} 项，勾选后点「恢复到…」")
         elif mode == "raw":
             # 小盘（U 盘 / 虚拟盘）用 GB 会四舍五入成「0GB」，看着像没扫
@@ -5386,14 +5360,6 @@ class RecoveryPage(Page):
             kind = self._image_boot_kind(path, self._image_base)
             hint = recovery.boot_hint(kind, self._image_letter or None)
             self._apply_fs(kind, hint)
-            # 镜像里没有「当前系统的回收站」，停在①只会立刻被拦一次。
-            # NTFS 镜像切到③（扫残留记录），FAT/exFAT 镜像切到②（扫目录项）。
-            if self._mode_key() == "recycle":
-                want = "raw" if kind == "ntfs" else "mft"
-                for b in self._group.buttons():
-                    if b.mode_key == want and b.isEnabled():
-                        b.setChecked(True)
-                        break
         else:
             self.lb_src.setText("")
 
@@ -5650,7 +5616,7 @@ class RecoveryPage(Page):
             QMessageBox.information(
                 self, "这些都没法导出",
                 f"勾的 {len(items)} 项里，没有一项能导出内容：\n\n{detail}\n\n"
-                "「只有名字」的请用 ④「按文件类型找」按内容去捞；"
+                "「只有名字」的请用上面的「按文件类型找」按内容去捞；"
                 "被清零/加密/压缩的，本工具确实做不到 —— 换工具也一样要先解决这一层。")
             return
         if counts:

@@ -512,10 +512,15 @@ class RecoveryScanTask(BaseTask):
     """找可恢复的东西（三种模式共用）。
 
     全部在后台线程、全部只读：
-      recycle  回收站里还在的条目（秒级，不需要管理员）
+      auto     一键自动：回收站 → 已删除记录 →（必要时）格式化残留，结果合并去重（默认）
+      recycle  只扫回收站（保留给「就想看看回收站」的调用）
       mft      扫当前 MFT 找已删除记录（几十秒，需要管理员读原始卷）
       raw      扫残留旧记录 + INDX 目录索引 —— 格式化之后也能带回原名和目录（慢）
       carve    在未分配空间里按文件类型抠（只认内容，直接写目标目录）
+
+    为什么默认是 auto：用户既不知道也不记得文件是怎么没的（"回收站清空了吗？
+    我是删了还是格式化了？"），让他先做这道选择题等于把判断成本推给他。
+    实际上这件事有明确的判断顺序，程序自己跑一遍就行。
     """
 
     done = Signal(object)
@@ -559,9 +564,104 @@ class RecoveryScanTask(BaseTask):
                 vol.close()
         self.done.emit(out)
 
+    def _auto(self, out, src):
+        """一键查找：按「又快又稳 → 又慢又全」自动跑，结果合并去重。
+
+        三步的判断顺序是固定的，不需要用户选：
+          1. **回收站**（秒级）：还在回收站的文件根本没被动过，原样还原最准；
+          2. **已删除记录**（几十秒）：NTFS 扫 $MFT，FAT/exFAT 扫目录项，
+             能带回文件名和原目录；
+          3. **格式化残留**（几分钟起）：只有前两步几乎没捞到东西、或者用户勾了
+             「找得更彻底」才跑 —— 它要扫整卷，无脑跑会让每次点按钮都等很久。
+
+        三步的结果按「记录号」去重（回收站条目没有记录号，用名字+大小+路径）：
+        同一条 MFT 记录在 ② 和 ③ 里都会出现，保留先入的（证据更强的那份）。
+        """
+        merged, seen = [], {}
+        stages = []
+        t0 = time.time()
+
+        def take(items, tag):
+            added = 0
+            for it in items or []:
+                idx = it.get("idx")
+                key = (("i", idx) if idx is not None
+                       else ("n", it.get("name"), it.get("size"), it.get("path")))
+                if key in seen:
+                    continue
+                it["_stage"] = tag
+                seen[key] = it
+                merged.append(it)
+                added += 1
+            return added
+
+        # ── 第 1 步：回收站（镜像里没有回收站，跳过）──
+        if not self.image and not self._stop:
+            self.progress.emit(0, 3, "第 1 步 / 3：看回收站…")
+            try:
+                rec = recovery.recycle_items(self.letter) or []
+            except Exception:                      # noqa: BLE001
+                rec = []
+            stages.append(("回收站", take(rec, "recycle")))
+
+        # ── 第 2 步：已删除记录（NTFS=MFT，FAT/exFAT=目录项）──
+        st2, items2 = {}, []
+        if not self._stop:
+            self.progress.emit(0, 3, "第 2 步 / 3：扫磁盘上的已删除记录…")
+            try:
+                items2, st2 = recovery.scan_deleted(
+                    src, limit=3000,
+                    progress=lambda i, n: None if self._stop else self.progress.emit(
+                        i, max(n, 1), "第 2 步 / 3：正在扫已删除记录…"),
+                    cancel=self.stopped)
+            except Exception as exc:               # noqa: BLE001
+                self.failed.emit(f"扫已删除记录失败：{exc}")
+                return
+            stages.append(("已删除记录", take(items2, "deleted")))
+
+        # ── 第 3 步：格式化残留（只在「几乎没找到」或用户要求时）──
+        need_deep = bool(self.deep) or len(items2) < 8
+        st3 = {}
+        if need_deep and not self._stop:
+            self.progress.emit(0, 3, "第 3 步 / 3：深挖格式化后的残留（慢，可随时停）…")
+            try:
+                items3, st3 = recovery.metadata_scan(
+                    src,
+                    budget=self.budget or (900 if self.deep else 180),
+                    only_free=not self.deep, limit=3000,
+                    progress=lambda i, n, text: None if self._stop else self.progress.emit(
+                        i, max(n, 1), "第 3 步 / 3：正在深挖格式化残留…"),
+                    cancel=self.stopped)
+            except Exception as exc:               # noqa: BLE001
+                self.failed.emit(f"深挖格式化残留失败：{exc}")
+                return
+            stages.append(("格式化残留", take(items3, "residual")))
+
+        order = {"recycle": 0, "good": 1, "dir": 2, "risky": 3,
+                 "unknown": 4, "no_data": 5, "name_only": 6}
+        merged.sort(key=lambda i: (order.get(i.get("confidence"), 9),
+                                   -int(i.get("_t") or 0)))
+        out["items"] = merged
+        out["stats"] = {
+            "found": len(merged),
+            "good": sum(1 for i in merged if i.get("confidence") == "good"),
+            "risky": sum(1 for i in merged if i.get("confidence") == "risky"),
+            "recycle": sum(1 for i in merged if i.get("confidence") == "recycle"),
+            "stages": stages,
+            "deep_ran": need_deep,
+            "deep_wanted": bool(self.deep),
+            "letter": self.letter,
+            "fs": st2.get("fs") or st3.get("fs") or "",
+            "truncated": bool(st2.get("truncated") or st3.get("truncated")),
+            "elapsed": round(time.time() - t0, 1),
+            "fs_label": getattr(src, "fs", "") or "",
+        }
+
     def _work(self, out, vol):
         src = vol if vol is not None else self.letter
-        if self.mode == "recycle":
+        if self.mode == "auto":
+            self._auto(out, src)
+        elif self.mode == "recycle":
             self.progress.emit(0, 1, "正在读回收站…")
             out["items"] = recovery.recycle_items(self.letter)
             out["stats"] = {"found": len(out["items"])}
