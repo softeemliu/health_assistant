@@ -941,6 +941,28 @@ def probe(path):
     return "raw", "整盘镜像"
 
 
+def source_size(path):
+    """这份镜像在磁盘上占多少字节。
+
+    E01 是多分卷，只看用户点的那一段会少算（实测 8 段各 2MB，界面显示「0 MB」）。
+    这里把同一套的段全加起来；其它格式就是文件本身的大小。
+    """
+    try:
+        kind, _label = probe(path)
+        if kind == "e01":
+            total = 0
+            for p in _ewf_segments(path):
+                try:
+                    total += os.path.getsize(p)
+                except OSError:
+                    pass
+            if total:
+                return total
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
+
 def open_path(path):
     """打开一份镜像，返回能按字节读的盘对象。
 

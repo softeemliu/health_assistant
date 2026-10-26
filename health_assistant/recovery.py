@@ -3050,16 +3050,23 @@ def metadata_scan(letter, budget=None, limit=None, progress=None, cancel=None,
                     break
                 n_rec = len(recs)
                 _scan_buffer(buf, pos, recs)
-                # 边扫边给界面看：这一批新认出的记录（还没合并、没核对内容）
-                for _off, _info in recs[n_rec:]:
-                    stream.add({
-                        "name": _info.get("name") or "",
-                        "size": _info.get("size") or 0,
-                        "mtime": _info.get("mtime") or "",
-                        "is_dir": bool(_info.get("is_dir")),
-                        "in_use": bool(_info.get("in_use")),
-                        "confidence": "pending",
-                    })
+                # 边扫边给界面看：这一批新认出的记录（还没合并、没核对内容）。
+                # 两条过滤，都是为了「推出去的不能被最后一步悄悄删掉」：
+                #   · `$MFT` / `$LogFile` 这类元文件永远不是用户要找的东西；
+                #   · 整卷深扫（only_free=False）最后会剔除「还在用的」记录，
+                #     那就先不推，免得列表里出现又消失。
+                if stream.sink is not None and only_free:
+                    for _off, _info in recs[n_rec:]:
+                        _nm = _info.get("name") or ""
+                        if not _nm or _nm.startswith("$"):
+                            continue
+                        stream.add({
+                            "name": _nm,
+                            "size": _info.get("size") or 0,
+                            "mtime": _info.get("mtime") or "",
+                            "is_dir": bool(_info.get("is_dir")),
+                            "confidence": "pending",
+                        })
                 if with_index:
                     j = buf.find(b"INDX")
                     while j >= 0:

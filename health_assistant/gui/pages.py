@@ -27,7 +27,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QButtonGroup, QCheckBox,
                                QTreeWidgetItem, QVBoxLayout, QWidget)
 
 from .. import (catalog, credentials, filelock, leftover, memtrim, metrics,
-                partitions, planclean, recovery, regclean, slim)
+                partitions, planclean, recovery, regclean, slim, vdisk)
 from ..core import (GROUP_ORDER, GROUP_TITLES, cli_cmd, fb, is_admin,
                     no_window_kwargs)
 from .preview_ui import PreviewDialog, PreviewJob, PreviewPane
@@ -5158,15 +5158,24 @@ class RecoveryPage(Page):
 
         `base` 非 0 时看的是分区起点那个扇区 —— 整盘镜像的 0 偏移是分区表，
         按 0 判断会得到「mbr」，界面就会把四种方式全灰掉。
+
+        ⚠️ 必须走 `vdisk`（4.22.0 修）：这里以前直接 `open(path,"rb")` 按文件偏移读。
+        VHD / VHDX / VMDK / **E01** 这类容器里，文件偏移上的字节不是盘上的字节 ——
+        于是判出来是「认不出的格式」，`_mode_key()` 把用户甩进「按文件类型找」，
+        真正的「已删除记录 / 格式化残留」反而被藏起来了。容器解得开、这里却按裸文件读，
+        等于前功尽弃。
         """
         try:
-            with open(path, "rb") as fh:
-                fh.seek(base)
-                head = fh.read(512)
-                fh.seek(base + 1024)
-                ext = fh.read(2)
+            disk = vdisk.open_path(path)
+        except (vdisk.VDiskError, OSError):
+            return "unknown"
+        try:
+            head = disk.read(base, 512)
+            ext = disk.read(base + 1024, 2)
         except OSError:
             return "unknown"
+        finally:
+            disk.close()
         if len(head) < 512:
             return "unknown"
         return recovery.boot_kind(head, ext)
@@ -5479,7 +5488,8 @@ class RecoveryPage(Page):
         self._image_part = part
         self.cb_vol.setEnabled(not path)
         if path:
-            size = os.path.getsize(path) / (1024 ** 2) if os.path.isfile(path) else 0
+            # E01 是分卷的，只看用户点的那一段会显示成「0 MB」→ 让 vdisk 把各段加起来
+            size = vdisk.source_size(path) / (1024 ** 2) if os.path.isfile(path) else 0
             self.lb_src.setText(
                 f"来源：镜像 {os.path.basename(path)}（{size:.0f} MB"
                 + (f"，原盘 {self._image_letter}" if self._image_letter else "")
@@ -5631,7 +5641,7 @@ class RecoveryPage(Page):
             labels = [
                 f"第 {i + 1} 个分区　{p.get('fs') or '认不出'}　"
                 f"{(p.get('size') or 0) / (1024 ** 3):.1f} GB　"
-                f"（从 {(p.get('offset') or 0) / (1024 ** 2):.0f} MB 处开始）"
+                f"（从 {fb(p.get('offset') or 0)} 处开始）"
                 for i, p in enumerate(usable)]
             pick = 0
             if len(usable) > 1:
@@ -5682,7 +5692,7 @@ class RecoveryPage(Page):
         if base:
             self.lb_src.setText(self.lb_src.text() +
                                 f"　用的是 {recovery.boot_label(kind)} 分区，"
-                                f"从 {base / (1024 ** 2):.0f} MB 处开始")
+                                f"从 {fb(base)} 处开始")
         self.info.setText(f"已切到镜像：{os.path.basename(path)}　选好方式后点「开始查找」")
 
     def _find_lost_parts(self, path, layout):
@@ -5926,6 +5936,13 @@ class RecoveryPage(Page):
             self.bar_filter.hide()
             self.preview.clear()
             self.preview.hide()
+            # 边扫边出时这里可能已经摆过几行（比如扫到一半才被合并阶段剔掉的候选）。
+            # 结果为空就把它们清掉、条数栏复位 —— 不能留着「已经扫到 16 条，还在扫…」。
+            self._shown = []
+            self._matched = 0
+            self.table.set_check_rows([], [], checked=False)
+            self.lb_count.setText("")
+            self.lb_sel.setText("")
             return
         matched = catalog.filter_items(
             items,
