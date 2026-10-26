@@ -2136,7 +2136,7 @@ _REC_SIZE = 1024                  # 最常见的记录大小（只当「没证�
 _MAX_REC_SIZE = 65536             # NTFS 允许的上限；块与块之间的重叠按它算
 
 
-def _validate_record(rec, rec_size=None):
+def _validate_record(rec, rec_size=None, loose=False):
     """校验一段字节是不是一条完整的 NTFS 记录。
 
     为什么这么严：整块盘上 `FILE` 这四个字节到处都是（日志、图片里都可能出现）。
@@ -2145,6 +2145,13 @@ def _validate_record(rec, rec_size=None):
       2. 更新序列号数组（USA）的个数 = 记录里 512 字节扇区数 + 1；
       3. **每个扇区末尾 2 字节都等于 USA 里那个序列号** —— 这是 NTFS 的完整性校验位，
          随机数据几乎不可能满足。
+
+    `loose=True` 是给 `$LogFile` 用的：日志里存的是「**还没应用 fixup** 的记录原始
+    内容」（扇区尾是真数据，不是 USA 序列号），拿第 3 条去卡的话，实测 64MB 日志里
+    一条都过不了 —— 明明属性结构完整、名字都读得出来。所以这条路径只跳过第 3 条，
+    另外要求「记录头里的记录号（0x2C）> 0」，把随机数据挡在外面。
+    （记录号是 NTFS 写在记录头里的自身编号，日志副本保留了它 —— 有了它才能
+    把「这个名字」和「MFT 里的第几号记录」对上，也才能判断记录有没有被复用。）
 
     `rec_size` 不给就**从记录头自己算**：USA 个数 = 扇区数 + 1，所以
     `记录大小 = (USA 个数 - 1) × 512`。1KB 记录是 3、2KB 是 5、4KB 是 9。
@@ -2166,8 +2173,15 @@ def _validate_record(rec, rec_size=None):
     if usa_off < 8 or usa_off + usa_cnt * 2 > rec_size:
         return None
     seq = rec[usa_off:usa_off + 2]
-    for k in range(1, usa_cnt):
-        if rec[k * SECTOR - 2:k * SECTOR] != seq:
+    if not loose:
+        for k in range(1, usa_cnt):
+            if rec[k * SECTOR - 2:k * SECTOR] != seq:
+                return None
+    else:
+        self_no = _u32(rec, 0x2C)
+        if self_no == 0 or self_no > 0x7FFFFFFF:
+            return None
+        if _u16(rec, 0x10) == 0:              # 序号从 1 开始，0 是空/垃圾
             return None
     fixed = fixup_record(rec)
     names = parse_names(fixed)
@@ -2193,14 +2207,22 @@ def _validate_record(rec, rec_size=None):
         "encrypted": bool(data and data["encrypted"]),
         "data": (data or {}).get("value", b"") if (data and data["resident"]) else b"",
         "rec": rec_size,
+        "self_no": _u32(fixed, 0x2C),
+        "seq": _u16(fixed, 0x10),
+        "log_copy": loose,
     }
 
 
-def _scan_buffer(buf, base, found):
+def _scan_buffer(buf, base, found, step=SECTOR, loose=False):
     """在一块内存里找记录候选，把结果塞进 found（(绝对偏移, 记录信息)）。
 
     每条候选的记录大小都从它自己的 USA 个数推，**不假设整卷统一**
     （格式化前后记录大小可能不一样，两种混在同一个缓冲区里是正常的）。
+
+    `step` 默认 512：正常 MFT 区里记录都是 512 对齐的，跳着找快得多。
+    `$LogFile` 必须给 `step=1` —— 日志里每条记录前面有 0x30 字节记录头，记录的
+    起始偏移**不在 512 边界上**，按 512 步进找等于白扫（实测 64MB 日志：
+    512 步进 0 条，逐字节 6 条严格 / 4656 条宽松）。
     """
     i = buf.find(b"FILE")
     while i >= 0:
@@ -2209,10 +2231,10 @@ def _scan_buffer(buf, base, found):
             rs = ((cnt - 1) * SECTOR
                   if 2 <= cnt <= (_MAX_REC_SIZE // SECTOR) + 1 else 0)
             if rs and i + rs <= len(buf):
-                info = _validate_record(buf[i:i + rs], rs)
+                info = _validate_record(buf[i:i + rs], rs, loose=loose)
                 if info is not None:
                     found.append((base + i, info))
-        i = buf.find(b"FILE", i + SECTOR)
+        i = buf.find(b"FILE", i + step)
 
 
 def _assign_index(found, rec_size=None):
@@ -2240,6 +2262,11 @@ def _assign_index(found, rec_size=None):
         rec_size = max(tally.items(), key=lambda kv: kv[1])[0] if tally else _REC_SIZE
     votes = {}
     for off, info in found:
+        if info.get("log_copy") and info.get("self_no"):
+            # $LogFile 里的副本自带记录号（记录头 0x2C），不用推算 —— 它也不在
+            # MFT 的连续布局里，套锚点算术只会算出乱七八糟的编号。
+            info["index"] = info["self_no"]
+            continue
         if (info.get("rec") or rec_size) != rec_size:
             info["index"] = None
             continue
@@ -2251,6 +2278,8 @@ def _assign_index(found, rec_size=None):
     if votes:
         origin = max(votes.items(), key=lambda kv: kv[1])[0]
         for off, info in found:
+            if info.get("log_copy") and info.get("index") is not None:
+                continue
             if (info.get("rec") or rec_size) != rec_size:
                 continue
             delta = off - origin
@@ -2262,6 +2291,8 @@ def _assign_index(found, rec_size=None):
     prev_off = prev_idx = None
     for off, info in found:
         idx = None
+        if info.get("log_copy") and info.get("index") is not None:
+            continue
         if (info.get("rec") or rec_size) != rec_size:
             info["index"] = None
             prev_off = prev_idx = None
@@ -2359,6 +2390,7 @@ def raw_scan(letter, budget=None, limit=3000, progress=None, cancel=None,
         found = []
         scanned = 0
         truncated = False
+        problems = 0
         for start, end in extents:
             pos = start
             while pos < end:
@@ -2371,8 +2403,12 @@ def raw_scan(letter, budget=None, limit=3000, progress=None, cancel=None,
                 size = min(block, end - pos)
                 try:
                     buf = v.read(pos, size)
-                except RecoverError:
-                    break
+                except (RecoverError, OSError):
+                    # 坏扇区：跳过这一块继续往下扫。要恢复数据的盘，往往正是
+                    # 有坏道的那块 —— 一个坏点就让整段扫描放弃是最糟的结果。
+                    problems += 1
+                    pos += max(block - _MAX_REC_SIZE, SECTOR)
+                    continue
                 if not buf:
                     break
                 _scan_buffer(buf, pos, found)
@@ -2845,6 +2881,32 @@ def _is_noise_name(name):
     return bool(_RECYCLE_NAME_RE.match(name))
 
 
+def _log_copy_still_gone(vol, idx, info):
+    """`$LogFile` 里的这份副本，还值不值得列出来？
+
+    判据只有一条、而且是硬证据：**MFT 里这个编号现在不是同一个文件**。
+      · 编号空着（记录被释放还清了）→ 值得，日志里这份是它存在过的唯一证据；
+      · 编号已被别的文件占用（记录序号不同）→ 值得，那份是**上一代**的样子；
+      · 同代但已释放（in_use=0）→ 值得，名字正好补上；
+      · 同代、还在用 → 这是活文件几分钟前的样子，列出来纯噪音，扔掉。
+
+    实测（D: 64MB 日志，4656 条副本）：2089 条是活文件、1822 条是同一个文件的
+    8.3 短名形式，真正的「旧文件」682 条 —— 不按这条判据过滤的话，日志会把
+    几千个**现有的**文件重新列一遍，把真正找回的东西淹掉。
+    """
+    try:
+        if not 0 < idx < vol.record_count:
+            return False                    # 编号越界 = 这份副本的记录头不可信
+        rec = vol.record(idx)
+    except (RecoverError, OSError):
+        return True
+    if not rec or rec[:4] != b"FILE" or len(rec) < 0x18:
+        return True
+    if _u16(rec, 0x10) != info.get("seq"):
+        return True
+    return not (_u16(rec, 0x16) & 1)
+
+
 def _merge_items(recs, indx, vol, limit=None, usn=None):
     """把「MFT 残留记录」「INDX 目录项」「USN 变更日志」按记录号合并成一份清单。
 
@@ -2858,9 +2920,22 @@ def _merge_items(recs, indx, vol, limit=None, usn=None):
     返回 (条目列表, MFT 覆盖到的记录号集合)。
     """
     names = {}
+    log_copies = {}
     for _off, info in recs:
-        if info.get("index") is not None:
-            names[info["index"]] = info
+        if info.get("index") is None:
+            continue
+        idx = info["index"]
+        if info.get("log_copy"):
+            # `$LogFile` 里的副本单独收，而且按 **(编号, 序号)** 分组：
+            # 同一个编号在日志里可能留着好几代的样子（记录被复用前前后后的快照），
+            # 按编号收会把它们压成一条，最新那代就是现在的活文件，一压就全被滤光。
+            key = (idx, info.get("seq"))
+            prev = log_copies.get(key)
+            if prev is None or (info.get("_t") or 0) > (prev.get("_t") or 0):
+                log_copies[key] = info
+            continue
+        if names.get(idx) is None:
+            names[idx] = info
     by_index = dict(names)
     indx_map = {}
     for e in indx:
@@ -2872,6 +2947,8 @@ def _merge_items(recs, indx, vol, limit=None, usn=None):
     mft_refs = set()
     for idx, info in by_index.items():
         if not info["in_use"]:
+            continue
+        if info.get("log_copy") and not _log_copy_still_gone(vol, idx, info):
             continue
         if _is_noise_name(info["name"]):
             # NTFS 自己的元文件（$MFT / $LogFile / $Volume / $MFTMirr…）和
@@ -2901,7 +2978,41 @@ def _merge_items(recs, indx, vol, limit=None, usn=None):
             "data_off": info["data"],
             "cluster_count": sum(c for _l, c, _s in info["runs"]),
             "letter": vol.letter,
-            "source": "mft",
+            "source": "log" if info.get("log_copy") else "mft",
+        })
+
+    for (idx, _seq), info in log_copies.items():
+        # 不看 `idx in mft_refs`：日志副本对应的编号**正好**可能现在被新文件占着
+        # （记录被复用），那才是它最值钱的时候。是不是「同一个文件」交给
+        # `_log_copy_still_gone` 按记录序号判，别拿编号当身份。
+        if not info["in_use"]:
+            continue
+        if not _log_copy_still_gone(vol, idx, info):
+            continue
+        if _is_noise_name(info["name"]):
+            continue
+        key = (info["name"], info["size"], info["mtime"],
+               tuple((r[0], r[1]) for r in info["runs"][:4]))
+        if key in seen:
+            continue
+        seen.add(key)
+        conf = "dir" if info["is_dir"] else _confidence_quick(vol, info)
+        if conf == "no_data" and not info["is_dir"]:
+            continue
+        items.append({
+            "idx": idx,
+            "name": info["name"],
+            "path": _path_from_map(idx, names),
+            "size": info["size"],
+            "mtime": info["mtime"],
+            "is_dir": info["is_dir"],
+            "confidence": conf,
+            "resident": info["resident"],
+            "runs": info["runs"],
+            "data_off": info["data"],
+            "cluster_count": sum(c for _l, c, _s in info["runs"]),
+            "letter": vol.letter,
+            "source": "log",
         })
 
     for ref, e in indx_map.items():
@@ -2991,8 +3102,20 @@ def metadata_scan(letter, budget=None, limit=None, progress=None, cancel=None,
 
       · MFT 残留记录（`_scan_buffer`）       → 带数据位置，能直接导出；
       · INDX 目录索引（`_parse_indx`）        → 只剩名字/目录/时间/大小；
-      · $LogFile / $MFTMirr 里的旧记录副本   → 带数据位置（NTFS 日志的 redo 数据）；
+      · $LogFile / $MFTMirr 里的旧记录副本   → 补「MFT 里已经没有的旧名字」；
       · $UsnJrnl:$J 变更日志（`usn_records`）→ 只剩名字（只追加，最抗覆盖）。
+
+    **`$LogFile` 这一路的实测结论（4.25.0，别指望它救急）**：日志里确实躺着大量
+    记录副本（D: 69MB 日志区扫出 4800 多条），但按「编号 + 记录序号」判身份后，
+    绝大多数是**活文件几分钟前的样子**或者**回收站条目**（`$R`/`$I` 开头），
+    真正「MFT 里已经没有的旧文件名字」在这块盘上是 **0 条**。原因是两条：
+      · `$LogFile` 只覆盖最近几十次~几千次元数据操作（64MB 日志 / 每天几十万次
+        操作 ≈ 几分钟到几小时），误删往往是几天后才发现；
+      · NTFS 删除文件只改记录头的 in-use 位（走「部分更新」日志），日志里不会留下
+        「删除后的完整记录」，留下的反而是**创建时**的快照 —— 而那时文件还活着。
+    所以这一路只当「有就赚」：判据卡死（只收 MFT 里同一编号已经不是同一文件的），
+    扫出来的每条都标 `source="log"`，界面上能看出它来自日志。真要救名字，
+    靠 `$UsnJrnl` / `$I30` 更靠谱。
 
     合并的钥匙是 NTFS 的「记录号」：四处都带着它，所以名字和内容能对上同一个文件。
     扫描全程只读。
@@ -3022,6 +3145,7 @@ def metadata_scan(letter, budget=None, limit=None, progress=None, cancel=None,
         scanned = 0
         meta_scanned = 0
         truncated = False
+        problems = 0
         stream = _Streamer(on_batch)
 
         # USN 先跑：它只要几秒（实测 283MB 日志 5 秒），而且「名字」信息最难得。
@@ -3045,11 +3169,22 @@ def metadata_scan(letter, budget=None, limit=None, progress=None, cancel=None,
                 if time.time() - t0 > budget_s:
                     truncated = True
                     break
-                buf = v.read(pos, min(block, end - pos))
+                try:
+                    buf = v.read(pos, min(block, end - pos))
+                except (RecoverError, OSError):
+                    # 坏扇区：跳过这一块继续扫（以前这里不 catch，一个坏点就让
+                    # 整个「格式化恢复」报错退出 —— 实测 D: 全盘扫到错误码 23 就废了）
+                    problems += 1
+                    pos += max(block - _MAX_REC_SIZE, SECTOR)
+                    continue
                 if not buf:
                     break
                 n_rec = len(recs)
-                _scan_buffer(buf, pos, recs)
+                # 系统日志区（$LogFile / $MFTMirr）单独对待：里面的记录副本
+                # ① 不在 512 字节边界上（每条前面有日志记录头），② USA 还没应用。
+                # 按普通参数扫，实测 64MB 日志一条都捞不出来。
+                _scan_buffer(buf, pos, recs, step=1 if tag else SECTOR,
+                             loose=bool(tag))
                 # 边扫边给界面看：这一批新认出的记录（还没合并、没核对内容）。
                 # 两条过滤，都是为了「推出去的不能被最后一步悄悄删掉」：
                 #   · `$MFT` / `$LogFile` 这类元文件永远不是用户要找的东西；
@@ -3058,7 +3193,7 @@ def metadata_scan(letter, budget=None, limit=None, progress=None, cancel=None,
                 if stream.sink is not None and only_free:
                     for _off, _info in recs[n_rec:]:
                         _nm = _info.get("name") or ""
-                        if not _nm or _nm.startswith("$"):
+                        if not _nm or _nm.startswith("$") or _info.get("log_copy"):
                             continue
                         stream.add({
                             "name": _nm,
@@ -3138,6 +3273,8 @@ def metadata_scan(letter, budget=None, limit=None, progress=None, cancel=None,
             "usn_deleted": usn_stats.get("deleted", 0),
             "usn_error": usn_stats.get("error", ""),
             "from_usn": usn_merged,
+            "from_log": sum(1 for i in items if i.get("source") == "log"),
+            "read_problems": problems,
             "with_data": sum(1 for i in items if i["confidence"] != "name_only"),
             "name_only": sum(1 for i in items if i["confidence"] == "name_only"),
             "good": sum(1 for i in items if i["confidence"] == "good"),
