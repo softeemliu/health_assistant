@@ -1746,13 +1746,17 @@ def _confidence(vol, item):
     return "risky"                     # 一个字节都读不出来，按最坏的说
 
 
-def _refine_items(vol, items):
+def _refine_items(vol, items, progress=None):
     """对最终要展示的条目重算一次严格评级（要读文件头，比较贵）。
 
     为什么分两步：合并阶段会碰到几十万条记录，每条读 4KB 文件头会让整卷扫多花几十秒；
-    而用户真正会看的只有展示出来的那 ≤3000 条。所以「便宜判据过滤 → 截断 → 严格复核」。
+    而用户真正会看的只有展示出来的那前几万条。所以「便宜判据过滤 → 截断 → 严格复核」。
+    `progress(已核对, 总数)`：2 万条约 20 秒，不报进度界面看起来就是卡死了。
     """
-    for it in items:
+    total = len(items)
+    for k, it in enumerate(items):
+        if progress and k % 256 == 0:
+            progress(k, max(total, 1))
         if it.get("confidence") == "name_only":
             # 只有名字的条目（USN / INDX）本来就没有数据位置，
             # 重算会被判成 no_data，把「只剩名字」这个更准确的说法丢掉。
@@ -1761,6 +1765,8 @@ def _refine_items(vol, items):
             it["confidence"] = _confidence(vol, it)
         except (RecoverError, OSError):
             continue
+    if progress:
+        progress(total, max(total, 1))
     return items
 
 
@@ -1920,11 +1926,12 @@ def verify_recovered(dest, item):
 
 # ───────────────────── 残留元数据扫描（格式化了也能找回名字）─────────────────────
 
-_REC_SIZE = 1024
+_REC_SIZE = 1024                  # 最常见的记录大小（只当「没证据时」的默认值）
+_MAX_REC_SIZE = 65536             # NTFS 允许的上限；块与块之间的重叠按它算
 
 
-def _validate_record(rec):
-    """校验一段 1024 字节是不是一条完整的 NTFS 记录。
+def _validate_record(rec, rec_size=None):
+    """校验一段字节是不是一条完整的 NTFS 记录。
 
     为什么这么严：整块盘上 `FILE` 这四个字节到处都是（日志、图片里都可能出现）。
     真正的记录有三个硬特征，全中才认：
@@ -1932,15 +1939,25 @@ def _validate_record(rec):
       2. 更新序列号数组（USA）的个数 = 记录里 512 字节扇区数 + 1；
       3. **每个扇区末尾 2 字节都等于 USA 里那个序列号** —— 这是 NTFS 的完整性校验位，
          随机数据几乎不可能满足。
-    返回 {name, parent, size, mtime, is_dir, resident, runs, data, flags} 或 None。
+
+    `rec_size` 不给就**从记录头自己算**：USA 个数 = 扇区数 + 1，所以
+    `记录大小 = (USA 个数 - 1) × 512`。1KB 记录是 3、2KB 是 5、4KB 是 9。
+    以前把 1024 写死，格式化时选过 4K 记录的卷上**每一条记录都校验不过**，
+    整卷扫出来是空的 —— 用户看到的就是「这个工具什么都没找到」。
+    返回 {name, parent, size, mtime, is_dir, resident, runs, data, flags, rec} 或 None。
     """
-    if len(rec) < _REC_SIZE or rec[:4] != b"FILE":
+    if len(rec) < 8 or rec[:4] != b"FILE":
         return None
     usa_off = _u16(rec, 0x04)
     usa_cnt = _u16(rec, 0x06)
-    if usa_cnt != (_REC_SIZE // SECTOR) + 1:
+    if rec_size is None:
+        if not 2 <= usa_cnt <= (_MAX_REC_SIZE // SECTOR) + 1:
+            return None
+        rec_size = (usa_cnt - 1) * SECTOR
+    if usa_cnt != (rec_size // SECTOR) + 1 or len(rec) < rec_size:
         return None
-    if usa_off < 8 or usa_off + usa_cnt * 2 > len(rec):
+    rec = rec[:rec_size]
+    if usa_off < 8 or usa_off + usa_cnt * 2 > rec_size:
         return None
     seq = rec[usa_off:usa_off + 2]
     for k in range(1, usa_cnt):
@@ -1969,55 +1986,83 @@ def _validate_record(rec):
         "compressed": bool(data and data["compressed"]),
         "encrypted": bool(data and data["encrypted"]),
         "data": (data or {}).get("value", b"") if (data and data["resident"]) else b"",
+        "rec": rec_size,
     }
 
 
 def _scan_buffer(buf, base, found):
-    """在一块内存里找记录候选，把结果塞进 found（(绝对偏移, 记录信息)）。"""
+    """在一块内存里找记录候选，把结果塞进 found（(绝对偏移, 记录信息)）。
+
+    每条候选的记录大小都从它自己的 USA 个数推，**不假设整卷统一**
+    （格式化前后记录大小可能不一样，两种混在同一个缓冲区里是正常的）。
+    """
     i = buf.find(b"FILE")
     while i >= 0:
-        if i + _REC_SIZE <= len(buf):
-            info = _validate_record(buf[i:i + _REC_SIZE])
-            if info is not None:
-                found.append((base + i, info))
+        if i + 8 <= len(buf):
+            cnt = _u16(buf, i + 6)
+            rs = ((cnt - 1) * SECTOR
+                  if 2 <= cnt <= (_MAX_REC_SIZE // SECTOR) + 1 else 0)
+            if rs and i + rs <= len(buf):
+                info = _validate_record(buf[i:i + rs], rs)
+                if info is not None:
+                    found.append((base + i, info))
         i = buf.find(b"FILE", i + SECTOR)
 
 
-def _assign_index(found):
+def _assign_index(found, rec_size=None):
     """给找到的记录推算「原来是 MFT 里的第几号」。
 
     记录本身**不存自己的编号**，但父目录引用的是编号，没编号就拼不出路径。
 
     做法不是「一条条接着数」，而是**用锚点算基准、再按偏移做算术**：
       · `$MFT` 恒为 0 号记录，根目录 `.` 恒为 5 号 —— 只要找到它们，就知道
-        「偏移 X 对应编号 k」，于是 `起始偏移 = X - k * 1024`；
-      · 之后任何一条记录：`编号 = (偏移 - 起始偏移) / 1024`。
+        「偏移 X 对应编号 k」，于是 `起始偏移 = X - k × 记录大小`；
+      · 之后任何一条记录：`编号 = (偏移 - 起始偏移) ÷ 记录大小`。
     为什么不用「上一条 +1」：中间只要有一条记录校验没过（正常，MFT 里有空记录），
     链子就断了 —— 实测 20 万条只能认出 16 条。算术法不怕中间有洞。
+
+    记录大小不再写死 1024：不传就取「结果里数量最多的那种」，同一次扫描里
+    大小不一致的记录（旧 MFT 的 1KB 混着新 MFT 的 4KB）不参与这套算术，
+    编号留空 —— 拿错的大小去算，路径会整批拼错，比留空更误导。
     """
     found.sort(key=lambda x: x[0])
+    if rec_size is None:
+        tally = {}
+        for _off, info in found:
+            rs = info.get("rec") or _REC_SIZE
+            tally[rs] = tally.get(rs, 0) + 1
+        rec_size = max(tally.items(), key=lambda kv: kv[1])[0] if tally else _REC_SIZE
     votes = {}
     for off, info in found:
+        if (info.get("rec") or rec_size) != rec_size:
+            info["index"] = None
+            continue
         if info["name"] == "$MFT" and not info["is_dir"]:
             votes[off] = votes.get(off, 0) + 1
         elif info["name"] == "." and info["is_dir"]:
-            origin = off - 5 * _REC_SIZE
+            origin = off - 5 * rec_size
             votes[origin] = votes.get(origin, 0) + 1
     if votes:
         origin = max(votes.items(), key=lambda kv: kv[1])[0]
         for off, info in found:
+            if (info.get("rec") or rec_size) != rec_size:
+                continue
             delta = off - origin
-            info["index"] = (delta // _REC_SIZE
-                             if delta >= 0 and delta % _REC_SIZE == 0 else None)
+            info["index"] = (delta // rec_size
+                             if delta >= 0 and delta % rec_size == 0 else None)
         return
     # 一个锚点都没有（旧 MFT 的头几条恰好被覆盖）：退化成相邻连续就接着数，
     # 能认出多少算多少，认不出的编号留空（路径会标「原目录已不在」）。
     prev_off = prev_idx = None
     for off, info in found:
         idx = None
+        if (info.get("rec") or rec_size) != rec_size:
+            info["index"] = None
+            prev_off = prev_idx = None
+            continue
         if prev_off is not None and off == prev_off:
             idx = prev_idx
-        elif prev_off is not None and off - prev_off == _REC_SIZE and prev_idx is not None:
+        elif prev_off is not None and off - prev_off == rec_size and prev_idx is not None:
             idx = prev_idx + 1
         info["index"] = idx
         prev_off, prev_idx = off, idx
@@ -2127,7 +2172,10 @@ def raw_scan(letter, budget=None, limit=3000, progress=None, cancel=None,
                 _scan_buffer(buf, pos, found)
                 scanned += len(buf)
                 progress and progress(min(scanned, total_span), total_span, "正在找残留的旧文件记录…")
-                pos += max(SECTOR, len(buf) - _REC_SIZE)     # 留一条记录的交叠，别漏跨块的
+                # 块与块之间要重叠「至少一条记录」，否则跨块的那条两边都凑不齐、
+                # 直接被丢掉。以前按 1KB 重叠，4K 记录的卷上，凡是从块末尾
+                # 1~4KB 处开始的记录全都漏了。
+                pos += max(len(buf) - _MAX_REC_SIZE, SECTOR)     # 留一条记录的交叠，别漏跨块的
             if truncated:
                 break
 
@@ -2725,9 +2773,9 @@ def _merge_items(recs, indx, vol, limit=None, usn=None):
     return items, mft_refs
 
 
-def metadata_scan(letter, budget=None, limit=3000, progress=None, cancel=None,
+def metadata_scan(letter, budget=None, limit=None, progress=None, cancel=None,
                   only_free=True, block=8 << 20, with_index=True,
-                  with_usn=True, with_meta=True):
+                  with_usn=True, with_meta=True, verify=20000):
     """格式化恢复的完整版：**MFT 残留记录 + INDX 目录索引 + USN 变更日志**，三路合并。
 
     商业软件（ReclaiMe / R-Studio / DiskGenius / UFS Explorer）在格式化场景就是
@@ -2740,6 +2788,11 @@ def metadata_scan(letter, budget=None, limit=3000, progress=None, cancel=None,
 
     合并的钥匙是 NTFS 的「记录号」：四处都带着它，所以名字和内容能对上同一个文件。
     扫描全程只读。
+
+    `limit`：返回条数上限，**默认 None = 全部**。以前默认 3000，格式化过的盘
+    动辄十几万条残留，用户只看到 3000 条就以为「没找到东西」——上限不许伪装成全部。
+    `verify`：逐条核对内容（每条要读盘）的条数，默认 2 万条；超出部分标
+    `unverified`，照样列出来、点开哪条核对哪条，比悄悄砍掉诚实，也比全量核对快得多。
     """
     v = letter if isinstance(letter, NtfsVolume) else NtfsVolume(letter)
     own = not isinstance(letter, NtfsVolume)
@@ -2801,7 +2854,10 @@ def metadata_scan(letter, budget=None, limit=3000, progress=None, cancel=None,
                     min(scanned, span), span,
                     f"正在翻系统日志区（{tag}）…" if tag
                     else "正在找残留的文件记录和目录索引…")
-                pos += max(SECTOR, len(buf) - _REC_SIZE)
+                # 块与块之间要重叠「至少一条记录」，否则跨块的那条两边都凑不齐、
+                # 直接被丢掉。以前按 1KB 重叠，4K 记录的卷上，凡是从块末尾
+                # 1~4KB 处开始的记录全都漏了。
+                pos += max(len(buf) - _MAX_REC_SIZE, SECTOR)
             if truncated:
                 break
 
@@ -2819,13 +2875,22 @@ def metadata_scan(letter, budget=None, limit=3000, progress=None, cancel=None,
             merged, live_dropped = _drop_live_records(v, merged)
         # 统计要在截断前取：USN 条目排在 name_only 末尾，一截断就数不到了
         usn_merged = sum(1 for i in merged if i.get("source") == "usn")
-        if len(merged) > limit:
+        cut = False
+        if limit is not None and len(merged) > limit:
             merged = merged[:limit]
-            truncated = True
+            cut = True                       # 调用方自己要的上限，不是「时间到了」
         items = merged
-        # 截断之后再算严格评级：读文件头比较贵，只对要展示的这 ≤limit 条做。
-        # 这一步是 4.12.0 的核心 —— 「能恢复」必须有证据，不能靠位图猜。
-        _refine_items(v, items)
+        # 严格评级（读文件头）只对前 verify 条做：每条 0.3ms，15 万条要 1 分钟。
+        # 剩下的标 unverified —— 记录还在、数据位置也在，点开那一条时再核对。
+        n_verify = len(items) if verify is None else min(verify, len(items))
+        _refine_items(v, items[:n_verify],
+                      None if progress is None else
+                      (lambda i, n: progress(i, n, "正在逐个确认内容还在不在…")))
+        if n_verify < len(items):
+            for it in items[n_verify:]:
+                if it.get("confidence") == "name_only":
+                    continue                 # 只有名字的条目本来就没有内容可核对
+                it["confidence"] = "unverified"
         # 一条都没找到时，顺手抽样看空闲区是不是已经被清零/擦除（TRIM 已落地）
         zero = None
         if not items:
@@ -2856,6 +2921,11 @@ def metadata_scan(letter, budget=None, limit=3000, progress=None, cancel=None,
             "scanned": scanned,
             "span": span,
             "truncated": truncated,
+            "cut": cut,
+            "verified": n_verify,
+            "unverified": max(0, len(items) - n_verify
+                              - sum(1 for i in items[n_verify:]
+                                    if i["confidence"] == "name_only")),
             "elapsed": round(time.time() - t0, 1),
         }
         return items, stats

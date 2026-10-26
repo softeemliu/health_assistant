@@ -632,7 +632,7 @@ class RecoveryScanTask(BaseTask):
                 items3, st3 = recovery.metadata_scan(
                     src,
                     budget=self.budget or (900 if self.deep else 180),
-                    only_free=not self.deep, limit=3000,
+                    only_free=not self.deep, limit=None,
                     progress=lambda i, n, text: None if self._stop else self.progress.emit(
                         i, max(n, 1), "第 3 步 / 3：正在深挖格式化残留…"),
                     cancel=self.stopped)
@@ -656,9 +656,10 @@ class RecoveryScanTask(BaseTask):
             "letter": self.letter,
             "fs": st2.get("fs") or st3.get("fs") or "",
             "truncated": bool(st2.get("truncated") or st3.get("truncated")),
-            # 「认出来多少条」和「列出多少条」是两件事：2 万条上限是为了界面不卡，
-            # 但不能让用户以为只有这么多 —— 界面会写「共认出 N 条，这里列 M 条」。
+            # 「认出来多少条」和「列出多少条」是两件事：界面一次只摆 2000 行（分批加载），
+            # 但结果本身是全量的，不能让人以为「就这么点」。
             "candidates": st2.get("candidates") or st3.get("candidates") or 0,
+            "unverified": st2.get("unverified") or st3.get("unverified") or 0,
             "elapsed": round(time.time() - t0, 1),
             "fs_label": getattr(src, "fs", "") or "",
         }
@@ -687,7 +688,7 @@ class RecoveryScanTask(BaseTask):
                 src,
                 # 整卷扫描按专业软件的路子给足时间：几百 GB 扫几个小时很正常
                 budget=self.budget or (900 if self.deep else 180),
-                only_free=not self.deep, limit=3000,
+                only_free=not self.deep, limit=None,
                 progress=lambda i, n, text: None if self._stop else self.progress.emit(
                     i, max(n, 1), text),
                 cancel=self.stopped)

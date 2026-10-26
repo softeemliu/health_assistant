@@ -5394,6 +5394,12 @@ class RecoveryPage(Page):
                     else f"{span_n / (1024 ** 2):.0f}MB")
             extra = ("　（时间到了先停，结果不全；可以再点一次接着找）"
                      if stats.get("truncated") else "")
+            unv = stats.get("unverified") or 0
+            if unv > 0:
+                extra += f"　其中 {unv} 条还没核对内容（点开哪条就核对哪条）"
+            if len(items) > VIEW_STEP:
+                extra += (f"　列表先摆 {VIEW_STEP} 条，"
+                          "点上方的「多看」可以一批批往下翻到全部")
             mode_txt = "整卷扫" if stats.get("whole_disk") else "只扫空闲区"
             live_txt = (f"；剔掉活文件 {stats.get('live_dropped', 0)} 条"
                         if stats.get("live_dropped") else "")
