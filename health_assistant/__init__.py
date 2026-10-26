@@ -43,7 +43,7 @@ from .core import (ActionPlan, Bars, Check, Context, Finding, Kind, KV,
                    get_checks, load_config)
 from .runner import load_plugins, run_checks
 
-__version__ = "4.18.0"
+__version__ = "4.19.0"
 __all__ = [
     "check", "Result", "Severity", "Kind", "Finding", "KV", "Table", "Text", "Bars",
     "ActionPlan", "Check", "REGISTRY", "get_checks", "Context", "load_config",

@@ -17,10 +17,26 @@ r"""health_assistant.carving — 按内容找文件（file carving），不依�
    CFB 走 FAT 表、EXE 走节表、TIFF 走 IFD 和 strip 表 …… 签名之后必须**结构自洽**
    才认，随机数据里「碰巧有几个字节像 jpg」的垃圾因此进不来。
 
+## 碎片（4.19.0 起的做法，边界写清楚）
+
+文件在盘上被拆成几段时，能做什么完全取决于**这种格式有没有断点标记**：
+
+* **MP4 / MOV**：`mdat` 的体积写在 box 头里，「moov 该在哪」算得出来；moov 被推后
+  了就去后面把它找回来，中间缺的那段**按 0 补**（不能跳过 —— stco 记的是绝对偏移，
+  挤掉缺口会让索引表全部错位）。结果标 `fragment`：能播，缺的那几个簇是花的。
+* **ZIP / Office**：目录区（EOCD，就 22 字节）被覆盖时不再整包丢弃，按本地文件头
+  逐条走、把内容照样交出来（标 weak）。
+* **JPEG**：熵编码区没有长度字段，**中间断掉就数学上无法接回去**。这里能做的只有
+  「识别出来别谎报」：熵数据里出现连续 2KB 可打印文本 = 那里是别人的文件（真实
+  熵数据出现这种排列的概率 ≈ 0），切在缺口之前、补 EOI 交出上半截，标 `fragment`。
+  以前这种情况会一路穿过缺口找到原图后半段的 FFD9，切出「长度正确、中间塞着别人
+  文件内容」的东西还报 ok。
+* **PNG / 压缩流（zlib、deflate、7z、rar）**：断在中间就解不出来，拼不回来。
+
 ## 边界（如实说，不装）
 
-* 只认内容，**原文件名和目录找不回来**；碎片化的文件（不连续存放）拼不回来，
-  这时会切出「半截」—— 所以每个结果都带 `verdict`（ok / weak），界面要能说清。
+* 只认内容，**原文件名和目录找不回来**；每个结果都带 `verdict`
+  （ok / weak / fragment），界面要能说清。
 * 不认加密内容（BitLocker / EFS）和清零区（TRIM 已落地）：读出来全是 0，找不到签名。
 * 扫描全程只读。
 """
@@ -102,6 +118,101 @@ def _find_forward(ctx, needle, off, cap, chunk=1 << 20):
     return -1
 
 
+_TEXT_BYTES = bytes(range(0x20, 0x7F)) + b"\t\n\r"
+
+
+def _is_text_block(raw):
+    """这一段是不是纯文本（可打印 ASCII + 制表/换行/回车）。
+
+    为什么需要：文件碎片化时，中间那几簇是别人的数据。JPEG 的熵编码区没有长度
+    字段，扫描会**一路穿过缺口**，遇到原图后半段的 FFD9 就收工 —— 于是切出一个
+    「长度正确、中间塞着别人文件内容」的东西，还报「完整」。
+
+    真实 JPEG 熵数据里连着 2048 字节全是可打印 ASCII 的概率 ≈ (0.4)^2048 ≈ 0
+    （Huffman 编码的字节分布接近均匀，还大量夹着 0x00-0x1F）。反过来说，文本
+    文件被当成缺口填充时几乎 100% 命中。
+
+    **不能**改用「无 FF 段太长」当判据：实测一条纯色 JPEG 里最长的无 FF 段有
+    67KB，那样会把正常照片判成碎片。
+    """
+    if not raw:
+        return False
+    return not raw.translate(None, _TEXT_BYTES)      # 删掉全部文本字符后为空
+
+
+def _text_start(ctx, end, floor, limit=1 << 16):
+    """从 `end` 往回走，找到这段文本真正的起点（最多回退 limit 字节）。"""
+    pos = end
+    stop = max(floor, end - limit)
+    while pos > stop:
+        b = ctx.byte(pos - 1)
+        if b < 0 or (b not in (0x09, 0x0A, 0x0D) and not (0x20 <= b <= 0x7E)):
+            break
+        pos -= 1
+    return pos
+
+
+def _find_text(ctx, lo, hi, window=1024, limit=1 << 17):
+    """在 [lo, hi) 这段「无 FF」区里从后往前找一个**整块都是文本**的窗口。
+
+    返回这段外来的文本的起点（切图就切在这儿），没有就返回 None。
+
+    为什么不能只看「紧挨着 FF 之前的那 2048 字节」：原图的后半段往往在缺口的
+    后面几百个字节内就出现 FF，那 2048 字节里既有文本又有图像数据，判不出来
+    —— 实测就是这么漏过去的。
+    """
+    end = hi
+    stop = max(lo, hi - limit)
+    while end - window >= stop:
+        if _is_text_block(ctx.get(end - window, window)):
+            return _text_start(ctx, end - window, lo)
+        end -= window
+    return None
+
+
+def _scan_entropy(ctx, pos, cap):
+    """走 JPEG 熵编码区，返回 (位置, 结局)。
+
+    结局：'eoi'（正常结束）/ 'marker'（下一个标记段，渐进式 JPEG 每段扫描都这样）/
+    'bad'（这里已经不是这张图的数据）/ 'foreign'（这里塞着别的文件的内容）/
+    'end'（走到头，文件被截断）。
+
+    JPEG 熵编码里 0xFF 只能后跟：00（字节填充）、D0-D7（RST 重启标记）、
+    D9（结束），或者 0xC0-0xFE（新标记段）。出现别的组合就说明数据到这儿为止了。
+    """
+    run = pos                               # 这一轮「无 FF」段的起点
+    while pos + 2 <= cap:
+        buf = ctx.get(pos, min(1 << 16, cap - pos))
+        if not buf:
+            return pos, "end"
+        i = buf.find(b"\xff")
+        if i < 0:
+            pos += max(1, len(buf) - 1)     # 留 1 字节，别把跨块的 FF 漏掉
+            continue
+        if i + 1 >= len(buf):
+            pos += i                        # 下一轮从 FF 开始读
+            continue
+        if pos + i - run >= 2048:
+            cut = _find_text(ctx, run, pos + i)
+            if cut is not None:
+                return cut, "foreign"
+        m = buf[i + 1]
+        if m == 0x00 or 0xD0 <= m <= 0xD7:
+            pos += i + 2
+            run = pos
+            continue
+        if m == 0xD9:
+            return pos + i, "eoi"
+        if 0xC0 <= m <= 0xFE:
+            return pos + i, "marker"        # 下一个标记段 / 下一张图
+        return pos + i, "bad"               # FF 后面跟了个不可能的字节
+    if cap - run >= 2048:
+        cut = _find_text(ctx, run, cap)
+        if cut is not None:
+            return cut, "foreign"
+    return pos, "end"
+
+
 def _u32be(buf, off):
     return struct.unpack_from(">I", buf, off)[0]
 
@@ -119,18 +230,23 @@ def _u32le(buf, off):
 # "weak" = 只能走到「结构不再自洽」为止（这类文件本来就没有结束标记）
 
 def p_jpeg(ctx, start, cap):
-    """JPEG：走到 SOS 之后按 EOI(FFD9) 收尾。
+    """JPEG：段链 + 熵编码区，走到 EOI(FFD9) 收尾。
 
-    两个都必须：**见过 SOF（帧头）和 SOS（扫描开始）**。只靠「能走到 FFD9」的话，
-    随机数据里的 FF D8 FF 加上一串碰巧连连看的段长，也能拼出几 MB 的假 JPEG ——
-    实测在 30MB 随机区里就这么生出两个 6MB 的假照片。
+    三道防线，缺一个就会出错：
+
+    1. **必须见过 SOF（帧头）和 SOS（扫描开始）**。只靠「能走到 FFD9」的话，
+       随机数据里的 FF D8 FF 加上一串碰巧连连看的段长，也能拼出几 MB 的假照片。
+    2. **段长必须和组件数对得上**（SOFn = 8+3×Nf，SOS = 6+2×Ns）。这条是防
+       假阳性的主力：实测用 `(i*37)&0xFF` 这种周期数据填充时，不做这条校验
+       能从 12MB 里抠出 10 张「照片」，全都打不开。
+    3. **熵编码区必须自洽**：0xFF 后面只能跟 00 / D0-D7 / 新标记。
+       走到头还没 EOI 就是被截断 —— 这时**不丢**，补个 EOI 交出去（见下）。
     """
     # 先看一眼 SOI 后面是不是合法的段标记（FF C0..FF FE）
     nxt = ctx.byte(start + 3)
     if nxt < 0 or not (0xC0 <= nxt <= 0xFE):
         return None
     pos = start + 2
-    segs = 0
     saw_sof = saw_sos = False
     while pos + 2 <= cap:
         if ctx.byte(pos) != 0xFF:
@@ -145,46 +261,77 @@ def p_jpeg(ctx, start, cap):
             pos += 2
             continue
         if m == 0xD9:                       # 还没 SOS 就到 EOI → 不是完整文件
-            return None
+            if not (saw_sof and saw_sos):
+                return None
+            n = pos + 2 - start
+            return (n, "ok") if n >= 128 else None
         if m in (0x01, 0xD8):
             pos += 2
             continue
         ln = ctx.u16(pos + 2, ">")
         if ln < 2 or pos + 2 + ln > cap:
             return None
-        segs += 1
-        if 0xC0 <= m <= 0xCF and m not in (0xC4, 0xC8, 0xCC):
+        head2 = ctx.get(pos + 4, 2)
+        if len(head2) < 2:
+            return None
+        if m == 0xDA:                       # SOS：段长 6 + 2×分量数
+            if ln != 6 + 2 * head2[0]:
+                return None
+            saw_sos = True
+        elif 0xC0 <= m <= 0xCF and m not in (0xC4, 0xC8, 0xCC):
+            # SOF 负载是「精度(1) 高(2) 宽(2) Nf(1) 分量×3」，Nf 在第 6 个字节。
+            # 别顺手用 head2[1] —— 那是高度高字节，读完得到的 Nf 永远是 0 或离谱值，
+            # 段长校验必然过不去（真照片全被判「不是 jpeg」）。
+            sof = ctx.get(pos + 4, 6)
+            if len(sof) < 6:
+                return None
+            nf = sof[5]
+            if not (1 <= nf <= 4) or ln != 8 + 3 * nf:   # SOF 段长 = 8 + 3×Nf
+                return None
             saw_sof = True
         pos += 2 + ln
-        if m == 0xDA:                       # SOS：熵编码区开始
-            saw_sos = True
-            break
         if not saw_sof and pos - start > (4 << 20):
             return None                     # 头部超过 4MB 还没帧头 → 假货
-    if not (saw_sof and saw_sos):
+        if m != 0xDA:
+            continue
+        # 进了熵编码区：一直走到「结束」或「下一个标记段」（渐进式 JPEG 有多段扫描）
+        end, kind = _scan_entropy(ctx, pos, cap)
+        if kind == "eoi":
+            n = end + 2 - start
+            return (n, "ok") if n >= 128 else None
+        if kind == "marker":
+            pos = end
+            continue
+        # 'bad'（数据不自洽）/ 'end'（走到头）/ 'foreign'（中间塞着别的文件）：
+        # 这张图被截断或碎片化了。以前这里 return None —— 整张照片直接没了，
+        # 用户眼里就是「工具什么都没找到」。上半截能看的照片远比「零件」有用：
+        # 按自洽范围切出来，补上 EOI 交出去。
+        if saw_sof and saw_sos and (end - start) >= 4096:
+            verdict = "fragment" if kind == "foreign" else "weak"
+            return (end - start, verdict, None, b"\xff\xd9")
         return None
-    eoi = _find_forward(ctx, b"\xff\xd9", pos, cap)
-    if eoi < 0:
-        return None
-    n = eoi + 2 - start
-    return (n, "ok") if n >= 128 else None
+    return None
+
+
+_PNG_IEND = b"\x00\x00\x00\x00IEND\xaeB`\x82"      # 长度 0 + "IEND" + 固定 CRC
 
 
 def p_png(ctx, start, cap):
     """PNG：chunk 链；第一块必须是 IHDR，走到 IEND 结束。"""
     pos = start + 8
     first = True
+    last_good = 0
     while pos + 12 <= cap:
         head = ctx.get(pos, 8)
         if len(head) < 8:
-            return None
+            break
         ln = _u32be(head, 0)
         typ = head[4:8]
         if ln > 0x7FFFFFFF:
-            return None
+            break
         nxt = pos + 12 + ln
         if nxt > cap:
-            return None
+            break                           # 头里写了 ln 字节，后面没有了 → 截断
         if first:
             if typ != b"IHDR":
                 return None
@@ -192,10 +339,56 @@ def p_png(ctx, start, cap):
             if len(ihdr) < 13 or _u32be(ihdr, 0) == 0 or _u32be(ihdr, 4) == 0:
                 return None
             first = False
+        last_good = nxt
         if typ == b"IEND":
             return (nxt - start, "ok")
         pos = nxt
+    # 链断了（碎片化 / 尾部被覆盖）。有 IHDR + 至少一个完整数据块的话，
+    # 这张图的上半截还能显示，补个 IEND 就能打开 —— 丢掉才是最差的选择。
+    if not first and last_good and (last_good - start) >= 1024:
+        # 只有「IDAT 的压缩流是完整的、单纯缺尾块」时补 IEND 才有意义（补上就能打开）。
+        # 数据本身被截断的话，补 IEND 只是假装完整，照样打不开 —— 那种就只标 weak，
+        # 交给专门的修复工具（或者用户自己认领上半截）。
+        if _png_idat_complete(ctx, start, last_good):
+            return (last_good - start, "weak", None, _PNG_IEND)
+        return (last_good - start, "weak")
     return None
+
+
+def _png_idat_complete(ctx, start, end):
+    """PNG 的像素数据（IDAT）能不能完整解压出来。"""
+    pos = start + 8
+    dec = zlib.decompressobj()
+    seen = False
+    try:
+        while pos + 12 <= end:
+            head = ctx.get(pos, 8)
+            if len(head) < 8:
+                return False
+            ln = _u32be(head, 0)
+            typ = head[4:8]
+            nxt = pos + 12 + ln
+            if nxt > end:
+                return False
+            if typ == b"IDAT":
+                seen = True
+                left = ln
+                p = pos + 8
+                while left > 0:
+                    buf = ctx.get(p, min(left, 1 << 20))
+                    if not buf:
+                        return False
+                    dec.decompress(buf)
+                    p += len(buf)
+                    left -= len(buf)
+                if dec.eof:
+                    return True
+            elif typ == b"IEND":
+                break
+            pos = nxt
+    except zlib.error:
+        return False
+    return bool(seen) and dec.eof
 
 
 def p_gif(ctx, start, cap):
@@ -344,34 +537,130 @@ _MP4_EXT = {b"heic": ".heic", b"heix": ".heic", b"hevc": ".heic", b"mif1": ".hei
             b"3gp5": ".3gp", b"M4A ": ".m4a", b"m4a ": ".m4a"}
 
 
+_MOV_RESUME_WINDOW = 8 << 20        # moov 被切到后面时，最多往后找这么远
+
+
+def _box_head(ctx, pos):
+    """读一个 box 头 → (类型, 大小) 或 None。"""
+    bh = ctx.get(pos, 16)
+    if len(bh) < 8:
+        return None
+    size = _u32be(bh, 0)
+    typ = bh[4:8]
+    if size == 1:
+        if len(bh) < 16:
+            return None
+        size = struct.unpack_from(">Q", bh, 8)[0]
+    if size < 8 or not all(32 <= c < 127 for c in typ):
+        return None
+    return typ, size
+
+
+def _mp4_resume(ctx, start, bpos, cap, ext):
+    """moov 被切到后面去了 —— 找它，中间那一截按 0 补。
+
+    **为什么「补零」而不是「跳过缺口把两截粘起来」**：`stco`/`co64` 里记的是
+    从文件开头算的**绝对偏移**，一旦把中间的洞挤掉，索引表全部错位，文件直接
+    打不开。补零保住偏移，视频只是那几个簇花屏。
+
+    **为什么知道该补多长**：`mdat` 的体积写在 box 头里，「moov 逻辑上在哪」
+    是算得出来的（就是 box 链断掉的位置 bpos）。物理上它被推后了多少，得靠找：
+    在簇边界上找 `moov`（带 `mvhd`），找到就知道尾部从哪儿开始。
+
+    断点往前对齐到簇边界再补零：文件系统的碎片一定是整簇整簇分开的，
+    最后那个不满一簇的尾巴之外的部分，盘上已经是别的文件了，读出来也不能用。
+    """
+    if bpos <= start + 8:
+        return None
+    end = min(cap, bpos + _MOV_RESUME_WINDOW)
+    pos = bpos
+    while pos < end:
+        buf = ctx.get(pos, min(1 << 20, end - pos))
+        if not buf:
+            return None
+        i = buf.find(b"moov")
+        while i >= 0:
+            box = pos + i - 4
+            if box >= bpos:                 # 只看断点之后的（前面是 mdat 自己的数据）
+                got = _box_head(ctx, box)
+                if got and got[0] == b"moov" and box + got[1] <= cap:
+                    # 内容里必须有 mvhd（媒体头），否则只是碰巧四个字节像 moov。
+                    # 注意**不能**要求 box 按簇对齐：mdat 的尾巴往往不满一簇，
+                    # moov 因此会落在簇中间（实测就是这么漏的）。
+                    if b"mvhd" in ctx.get(box + 8, 512):
+                        gap_start = bpos - (bpos % 4096)
+                        if gap_start < start:
+                            gap_start = start
+                        parts = [(start, gap_start - start)]
+                        if bpos > gap_start:
+                            parts.append((None, bpos - gap_start))
+                        parts.append((box, got[1]))
+                        return (parts, "fragment", ext)
+            i = buf.find(b"moov", i + 1)
+        pos += max(len(buf) - 3, 1)     # 留 3 字节防跨块漏掉；必须 ≥1 否则原地死循环
+    return None
+
+
 def p_mp4(ctx, start, cap):
-    """MP4/MOV/HEIC：走 box 链（size+type），跨多少块都行。"""
+    """MP4/MOV/HEIC：走 box 链（size+type），跨多少块都行。
+
+    `moov` 在文件尾（没用 faststart 的相机/录屏文件全是这样）。这类文件一旦
+    中间被别的文件占了几个簇，box 链就在 mdat 之后断掉 —— 以前直接 return None，
+    一整段录像彻底找不到；现在去后面把 moov 捞回来、中间补零交出（见 `_mp4_resume`）。
+    """
     head = ctx.get(start, 16)
     if len(head) < 12 or head[4:8] != b"ftyp":
         return None
     ext = _MP4_EXT.get(head[8:12], ".mp4")
     pos = start
     boxes = 0
+    saw_moov = saw_mdat = False
+    broke = False
     while pos + 8 <= cap and boxes < 8192:
         bh = ctx.get(pos, 16)
         if len(bh) < 8:
+            broke = True
             break
         size = _u32be(bh, 0)
         typ = bh[4:8]
         if size == 1:
             if len(bh) < 16:
-                return None
+                broke = True
+                break
             size = struct.unpack_from(">Q", bh, 8)[0]
         elif size == 0:
-            break                           # 到文件尾（或后面的填充），正常收尾
+            broke = True                    # 到文件尾（或后面的填充），正常收尾
+            break
         if size < 8 or not all(32 <= c < 127 for c in typ):
+            broke = True
             break
         if pos + size > cap:
-            return None
+            if not boxes:
+                return None                 # 第一个 box 就大到读不下 → 不是我们能处理的
+            # 后面的 box 越过 cap：多半是链已经走进了别人的数据（碎片）。
+            # 以前这里直接 return None，等于把整段录像扔了。
+            broke = True
+            break
+        if typ == b"moov":
+            saw_moov = True
+        elif typ == b"mdat":
+            saw_mdat = True
         pos += size
         boxes += 1
     if boxes < 1 or pos <= start + 8:
         return None
+    if not broke:                           # box 链一路走到头，就是完整文件
+        return (pos - start, "ok" if boxes >= 2 else "weak", ext)
+    # 只有「真走过 ftyp + mdat、头部已经有好几十 KB」才值得去找 moov。
+    # 不加这几道闸，脏盘上成千上万个碰巧像 box 的候选每个都去翻 8MB，扫描直接瘫掉
+    # （实测 220MB 的镜像从 2.6 秒变成几分钟都跑不完）。
+    if (not saw_moov) and saw_mdat and boxes >= 2 and (pos - start) >= (64 << 10):
+        stitched = _mp4_resume(ctx, start, pos, cap, ext)
+        if stitched:
+            return stitched
+    # 走完整 box 链、停在 box 边界上，本身就是证据（mdat 声明的体积已经满足了）。
+    # 这里不能因为「没见到 moov」就降级：不少录屏/相机的 MP4 只有 ftyp + mdat，
+    # 引擎按 max_len 之外去读当然读不到 moov，那不叫缺失。
     return (pos - start, "ok" if boxes >= 2 else "weak", ext)
 
 
@@ -413,10 +702,10 @@ def p_zip(ctx, start, cap):
     while True:
         i = _find_forward(ctx, b"PK\x05\x06", pos, cap, chunk=256 << 10)
         if i < 0:
-            return None
+            break
         tail = ctx.get(i, 22)
         if len(tail) < 22:
-            return None
+            break
         clen = struct.unpack_from("<H", tail, 20)[0]
         cd_size = _u32le(tail, 12)
         cd_off = _u32le(tail, 16)
@@ -425,6 +714,60 @@ def p_zip(ctx, start, cap):
         if ok and end <= cap:
             return (end - start, "ok", _zip_ext(ctx, start, min(256 << 10, end - start)))
         pos = i + 4
+    # 找不到完好的 EOCD：目录区（就 22 字节 + 变长的注释）是最容易被覆盖的部分。
+    # 以前这里直接丢弃整包 —— 但压缩包的文件内容都自带本地头，7-Zip / WinRAR
+    # 照样能按本地头把文件取出来。所以退一步交「内容还在、目录没了」的包。
+    data_len = _zip_local_len(ctx, start, cap)
+    if data_len:
+        return (data_len, "weak", _zip_ext(ctx, start, min(256 << 10, data_len)))
+    return None
+
+
+def _zip_local_len(ctx, start, cap, limit=1 << 20):
+    """只走本地文件头链，不依赖中央目录，返回数据区长度（认不出返回 0）。
+
+    每个本地头自带 compressed size，所以链是能逐条推下去的；只有「数据描述符」
+    模式（flags bit3，长度写在数据**后面**）拿不到长度，这时退化成往后找下一个
+    本地头签名。整条链一旦不自洽就停，绝不硬猜长度 —— 猜长了会把后面别的文件
+    也拼进来。
+    """
+    pos = start
+    n = 0
+    while n < 200000:
+        sig = ctx.get(pos, 4)
+        if sig == b"PK\x03\x04":
+            h = ctx.get(pos + 4, 26)
+            if len(h) < 26:
+                break
+            flags = struct.unpack_from("<H", h, 2)[0]
+            method = struct.unpack_from("<H", h, 4)[0]
+            csize = struct.unpack_from("<I", h, 14)[0]
+            nlen = struct.unpack_from("<H", h, 22)[0]
+            elen = struct.unpack_from("<H", h, 24)[0]
+            if method not in (0, 1, 6, 8, 9, 12, 14, 93, 95, 98, 99):
+                break
+            if not (0 < nlen <= 1024) or elen > 4096:
+                break
+            body = pos + 30 + nlen + elen
+            if body > cap:
+                break
+            if (flags & 0x08) and csize == 0:
+                j = _find_forward(ctx, b"PK\x03\x04", body,
+                                  min(cap, body + (1 << 20)))
+                if j < 0:
+                    pos = body
+                    break
+                pos = j
+            else:
+                if body + csize > cap:
+                    break
+                pos = body + csize
+            n += 1
+            continue
+        break                       # 中央目录 / EOCD / 数据完了
+    if n == 0:
+        return 0
+    return pos - start
 
 
 def _zip_ext(ctx, start, span):
@@ -913,6 +1256,8 @@ def p_mkv(ctx, start, cap):
         return None
     pos = start + 4 + used + sz
     elems = 0
+    has_cluster = False
+    clean = False                           # 结构主动拒绝（不是数据读没了）
     while pos < cap and elems < 100000:
         b = ctx.get(pos, 1)
         if not b:
@@ -923,6 +1268,7 @@ def p_mkv(ctx, start, cap):
             mask >>= 1
             ilen += 1
         if ilen > 4:
+            clean = True                    # 下一个字节不是合法的 EBML ID → 文件到头了
             break
         eid = int.from_bytes(ctx.get(pos, ilen), "big")
         pos += ilen
@@ -935,6 +1281,7 @@ def p_mkv(ctx, start, cap):
             mask >>= 1
             slen += 1
         if slen > 8:
+            clean = True
             break
         raw = ctx.get(pos, slen)
         if len(raw) < slen:
@@ -945,6 +1292,8 @@ def p_mkv(ctx, start, cap):
         unknown = val == (1 << (7 * slen)) - 1
         pos += slen
         if unknown or eid in _EBML_MASTER:
+            if eid == 0x1F43B675:           # Cluster：真的有媒体数据，不只是个头
+                has_cluster = True
             elems += 1
             continue
         pos += val
@@ -953,8 +1302,12 @@ def p_mkv(ctx, start, cap):
         return None
     if pos > cap:
         pos = cap
+        clean = False                       # 声明的体积超出实有数据 → 被截断，别报 ok
     ext = ".webm" if ctx.get(start, 64).find(b"webm") >= 0 else ".mkv"
-    return (pos - start, "weak", ext)
+    # MKV 的 Segment 多半写「未知长度」，正常文件也是走到「下一个字节不是合法 EBML」
+    # 才算完 —— 那本身就是结构证据，可以报 ok；只有「数据读没了」才算半截。
+    verdict = "ok" if (clean and has_cluster) else "weak"
+    return (pos - start, verdict, ext)
 
 
 # ───────────────────────────── 类型注册表 ─────────────────────────────
@@ -1163,6 +1516,19 @@ def carve(vol, out_dir, kinds=None, groups=None, budget_bytes=None, max_file=Non
         st["n"] += 1
         st[verdict] = st.get(verdict, 0) + 1
 
+    def _pieces(amount, start):
+        """把「长度」或「分段列表」统一成 [(偏移 或 None, 长度), …]。
+
+        `None` 表示这一段盘上已经没有原数据了（碎片缺口），按 0 补齐 ——
+        为什么补零而不是「跳过缺口把两截粘起来」：ZIP 的中央目录、MP4 的 stco
+        记的都是**从文件开头算的绝对偏移**，一旦把中间的洞挤掉，后面所有偏移
+        全部错位，粘出来反而打不开。补零能保住偏移，视频只是那一段花屏、
+        WAV 只是那一段静音，比「文件彻底打不开」好得多。
+        """
+        if isinstance(amount, (int, float)):
+            return [(start, int(amount))]
+        return [(off, int(n)) for off, n in amount]
+
     def flush():
         """把候选落到 out_dir。
 
@@ -1171,14 +1537,27 @@ def carve(vol, out_dir, kinds=None, groups=None, budget_bytes=None, max_file=Non
         """
         nonlocal dup
         while found and len(made) < max_files:
-            kind, start, length, verdict, ext = found.pop(0)
+            row = found.pop(0)
+            kind, start, amount, verdict, ext = row[:5]
+            # 截断的图要补一个结束标记才打得开（JPEG 补 EOI、PNG 补 IEND）
+            trailer = row[5] if len(row) > 5 else b""
+            parts = _pieces(amount, start)
+            length = sum(n for _o, n in parts)
             dest = _dest(kind, ext, len(made) + 1)
             if length <= (24 << 20):
-                blob = vol.read(start, length)
+                blob = bytearray()
+                for off, n in parts:
+                    if off is None:
+                        blob += bytes(n)
+                        continue
+                    chunk = vol.read(off, n)
+                    if len(chunk) < n:
+                        break
+                    blob += chunk
                 if len(blob) < 8 or len(blob) < length:
                     continue
                 if dedupe:
-                    h = hashlib.sha1(blob).digest()
+                    h = hashlib.sha1(bytes(blob)).digest()
                     if h in seen_hash:
                         dup += 1
                         continue
@@ -1186,29 +1565,46 @@ def carve(vol, out_dir, kinds=None, groups=None, budget_bytes=None, max_file=Non
                 try:
                     with open(dest, "wb") as fh:
                         fh.write(blob)
+                        if trailer:
+                            fh.write(trailer)
                 except OSError:
                     continue
                 _record(kind, verdict, dest)
                 continue
             written = 0
+            short = False
             try:
                 with open(dest, "wb") as fh:
-                    p, left = start, length
-                    while left > 0:
-                        buf = vol.read(p, min(left, 4 << 20))
-                        if not buf:
+                    for off, n in parts:
+                        if off is None:
+                            step = 4 << 20
+                            while n > 0:                 # 缺口按 0 补齐
+                                k = min(n, step)
+                                fh.write(b"\x00" * k)
+                                written += k
+                                n -= k
+                            continue
+                        p, left = off, n
+                        while left > 0:
+                            buf = vol.read(p, min(left, 4 << 20))
+                            if not buf:
+                                short = True
+                                break
+                            fh.write(buf)
+                            p += len(buf)
+                            left -= len(buf)
+                            written += len(buf)
+                        if short:
                             break
-                        fh.write(buf)
-                        p += len(buf)
-                        left -= len(buf)
-                        written += len(buf)
+                    if not short and trailer:
+                        fh.write(trailer)
             except OSError:
                 try:
                     os.remove(dest)
                 except OSError:
                     pass
                 continue
-            if written < max(length - (1 << 20), 8):
+            if short or written < max(length - (1 << 20), 8):
                 # 读不全（坏道 / 卷尾）→ 不留半截文件
                 try:
                     os.remove(dest)
@@ -1265,15 +1661,19 @@ def carve(vol, out_dir, kinds=None, groups=None, budget_bytes=None, max_file=Non
                         last_end = start + 1
                         continue
                     length, verdict = res[0], res[1]
-                    ext = res[2] if len(res) > 2 else spec["exts"][0]
-                    if length < max(spec["min_len"], min_size or 0):
+                    ext = (res[2] if len(res) > 2 else None) or spec["exts"][0]
+                    trailer = res[3] if len(res) > 3 else b""
+                    # 分段结果（碎片补齐）：长度按各段之和算，min/max 的闸门照样生效
+                    total_len = length if isinstance(length, (int, float)) else sum(
+                        n for _o, n in length)
+                    if total_len < max(spec["min_len"], min_size or 0):
                         last_end = start + 1
                         continue
-                    if length > (max_file or spec["max_len"]):
+                    if total_len > (max_file or spec["max_len"]):
                         last_end = start + 1
                         continue
-                    found.append((kid, start, length, verdict, ext))
-                    last_end = start + length
+                    found.append((kid, start, length, verdict, ext, trailer))
+                    last_end = start + max(total_len, 1)
                     if len(found) >= 64:
                         flush()
                     if len(made) >= max_files:

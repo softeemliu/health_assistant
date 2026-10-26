@@ -14,7 +14,7 @@ import os
 import subprocess
 import time
 
-from PySide6.QtCore import QItemSelectionModel, Qt, QTimer, Signal
+from PySide6.QtCore import QItemSelectionModel, Qt, QThreadPool, QTimer, Signal
 from PySide6.QtGui import QColor, QGuiApplication
 from PySide6.QtWidgets import (QAbstractItemView, QButtonGroup, QCheckBox,
                                QComboBox, QDialog, QDialogButtonBox,
@@ -30,11 +30,13 @@ from .. import (catalog, credentials, filelock, leftover, memtrim, metrics,
                 partitions, planclean, recovery, regclean, slim)
 from ..core import (GROUP_ORDER, GROUP_TITLES, cli_cmd, fb, is_admin,
                     no_window_kwargs)
+from .preview_ui import PreviewDialog, PreviewJob, PreviewPane
 from .theme import C, SEV, SEV_LABEL, sev_color
 from .widgets import (Badge, BlockView, CheckTable, DataTable, EmptyState,
                       FindingList, hline, show_error, window_busy)
 
 DB_PORTS = {1433, 3306, 3389, 5432, 6379, 9200, 27017}
+VIEW_STEP = 2000      # 恢复结果一次摆多少行（十几万行塞进表格会卡死，翻到底靠「多看」按钮）
 
 
 class Page(QWidget):
@@ -4707,6 +4709,10 @@ class RecoveryPage(Page):
         self._target = ""
         self._fs_kind = ""          # 这块盘是什么文件系统（ntfs / exfat / bitlocker…）
         self._fs_hint = ""          # 为什么用不了、现在能做什么（长文本，弹窗里看）
+        self._pv_token = 0          # 预览请求序号：晚到的旧结果直接丢
+        self._pv_hits = {}          # 已经看过的条目（同一条不必重复读盘）
+        self._view_limit = VIEW_STEP   # 当前摆出来多少行（「多看 N 条」会往上加）
+        self._matched = 0           # 符合筛选条件的一共有多少条
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 4, 6)      # 右/下留一点：别让按钮贴着边和状态栏
@@ -4853,14 +4859,14 @@ class RecoveryPage(Page):
             self.cb_kind.addItem(label, key)
         self.cb_kind.addItem("文件夹", "dir")
         self.cb_kind.addItem("其他", "other")
-        self.cb_kind.currentIndexChanged.connect(self._apply_filter)
+        self.cb_kind.currentIndexChanged.connect(self._reset_view)
         flt.addWidget(self.cb_kind)
         flt.addWidget(QLabel("时间"))
         self.cb_time = QComboBox()
         for label, days in (("全部", 0), ("今天", 1), ("最近 7 天", 7),
                             ("最近 30 天", 30)):
             self.cb_time.addItem(label, days)
-        self.cb_time.currentIndexChanged.connect(self._apply_filter)
+        self.cb_time.currentIndexChanged.connect(self._reset_view)
         flt.addWidget(self.cb_time)
         self.ed_kw = QLineEdit()
         self.ed_kw.setPlaceholderText("在文件名 / 原路径里找…")
@@ -4871,12 +4877,20 @@ class RecoveryPage(Page):
         self._kw_timer = QTimer(self)
         self._kw_timer.setSingleShot(True)
         self._kw_timer.setInterval(300)
-        self._kw_timer.timeout.connect(self._apply_filter)
+        self._kw_timer.timeout.connect(self._reset_view)
         self.ed_kw.textChanged.connect(lambda _t: self._kw_timer.start())
         flt.addWidget(self.ed_kw)
         self.lb_count = QLabel("")
         self.lb_count.setObjectName("Faint")
         flt.addWidget(self.lb_count, 1)
+        # 十几万条记录不截断，也不一次全塞进表格：先摆最新的一批，点一下再看下一批。
+        self.btn_more = QPushButton(f"多看 {VIEW_STEP} 条")
+        self.btn_more.setToolTip(
+            "再往下看一批（按删除时间从新到旧）。\n"
+            "盘里认出来的记录可能有十几万条，一次全摆出来表格会卡。")
+        self.btn_more.clicked.connect(self._show_more)
+        self.btn_more.hide()
+        flt.addWidget(self.btn_more)
         self.btn_view = QPushButton("按目录看")
         self.btn_view.setCheckable(True)
         self.btn_view.setToolTip(
@@ -4898,6 +4912,18 @@ class RecoveryPage(Page):
         self.table.counts_changed.connect(self._on_counts)
         self.table.hide()               # 先只显示空态，有结果再换成表（表头空着很怪）
         v.addWidget(self.table, 1)
+        # 选中一行就能看见「这是什么、能不能打开」——
+        # 按类型找出来的名字是程序起的，不看内容根本没法挑。双击看大图。
+        self.preview = PreviewPane()
+        self.preview.open_big.connect(self.open_preview)
+        self.preview.hide()
+        v.addWidget(self.preview)
+        self._pv_timer = QTimer(self)
+        self._pv_timer.setSingleShot(True)
+        self._pv_timer.setInterval(120)     # 防抖：按住方向键连翻时不要每次都读盘
+        self._pv_timer.timeout.connect(self._load_preview)
+        self.table.itemSelectionChanged.connect(self._on_row_pick)
+        self.table.cellDoubleClicked.connect(lambda *_: self.open_preview())
 
         # 按目录看：和表格二选一，勾选状态共享
         self.tree = QTreeWidget()
@@ -4910,6 +4936,8 @@ class RecoveryPage(Page):
         self.tree.setColumnWidth(2, 150)
         self.tree.setColumnWidth(3, 260)
         self.tree.itemChanged.connect(self._on_tree_check)
+        self.tree.currentItemChanged.connect(self._on_tree_pick)
+        self.tree.itemDoubleClicked.connect(lambda *_: self.open_preview())
         self.tree.hide()
         v.addWidget(self.tree, 1)
 
@@ -4997,7 +5025,10 @@ class RecoveryPage(Page):
 
     def check_safe(self):
         """把能恢复的都勾上（多了先确认一次：别让人一点就复制几百个文件出去）。"""
-        idx = [i for i, it in enumerate(self._items)
+        # 必须按 _shown 的下标来勾：表格的行对应的是「筛选后」的列表，
+        # 用 _items 的下标去勾，一加筛选就会勾到别人头上（原来就是这么错的）。
+        # 也不要勾 unverified（还没核对内容的）：勾错了等于让用户复制一堆可能坏的文件。
+        idx = [i for i, it in enumerate(self._shown or [])
                if it.get("confidence") in ("recycle", "good")]
         if not idx:
             QMessageBox.information(self, "没有可恢复的",
@@ -5155,6 +5186,10 @@ class RecoveryPage(Page):
         不再问「文件是进回收站了、删了、还是格式化了」—— 用户不记得，也不该被问。
         后台按「回收站 → 已删除记录 →（必要时）格式化残留」自动跑，结果合并去重。
         """
+        # 换了一块盘/一份镜像再扫：上一条的预览不能再留着（内容根本不是这块盘上的）
+        self.preview.clear()
+        self.preview.hide()
+        self._pv_hits.clear()
         if self.is_busy():
             return
         letter = self._letter
@@ -5259,10 +5294,14 @@ class RecoveryPage(Page):
                 f"{recovery.CARVE_LABEL.get(k, k)} {v.get('n', 0)}"
                 for k, v in sorted(by_kind.items(), key=lambda kv: -kv[1].get("n", 0))[:8])
             weak = sum(v.get("weak", 0) for v in by_kind.values())
+            frag = sum(v.get("fragment", 0) for v in by_kind.values())
             tail = (f"。扫了 {stats.get('scanned', 0) / (1024 ** 3):.1f}GB，"
                     f"{stats.get('elapsed', 0):.0f} 秒（{stats.get('speed', 0)}MB/s）")
             if stats.get("truncated"):
                 tail += "，没扫完就停了（可以再点一次接着找别的区域）"
+            if frag:
+                tail += (f"，其中 {frag} 个是「碎片」—— 文件在盘上被拆成了几段，"
+                         "已经尽量拼回去（中间缺的那一小段按空白补，能打开但那一小段是花的）")
             if weak:
                 tail += f"，其中 {weak} 个只找到半截（这类格式没有结束标记）"
             self.table.set_check_rows([], [])
@@ -5288,6 +5327,7 @@ class RecoveryPage(Page):
         # 列表内容交给 _apply_filter()：它会按当前筛选条件（类型/时间/关键字）
         # 决定显示哪些，并保住已经勾上的条目。
         self._fresh = True
+        self._view_limit = VIEW_STEP
         self._apply_filter()
         self.table.setVisible(bool(items))
         self.empty.setVisible(not items)
@@ -5327,8 +5367,15 @@ class RecoveryPage(Page):
                             else "　常规扫描没找到什么，已自动深挖")
             warn = stats.get("warn")
             cands = stats.get("candidates") or 0
-            more = (f"　共认出 {cands} 条，这里按时间从新到旧列了 {len(items)} 条"
-                    if cands > len(items) else "")
+            more = ""
+            if cands > len(items):
+                more = f"　共认出 {cands} 条，这里按时间从新到旧列了 {len(items)} 条"
+            if len(items) > VIEW_STEP:
+                more += (f"　列表先摆最新的 {VIEW_STEP} 条，"
+                         "点上方的「多看」可以一批批往下翻到全部")
+            unv = stats.get("unverified") or 0
+            if unv > 0:
+                more += f"　其中 {unv} 条还没核对内容（点开哪条就核对哪条）"
             self.info.setText(
                 f"找到 {len(items)} 项（{'，'.join(parts)}）{deep_txt}"
                 + more
@@ -5739,6 +5786,72 @@ class RecoveryPage(Page):
                 "开了之后，误删/误改都能从「以前的版本」里直接拿回来。")
 
     # ───────────── 杂项 ─────────────
+    # ───────────── 先看一眼：缩略图 / 内容预览 ─────────────
+    def _current_pick(self):
+        """当前选中的 (条目, 在 _shown 里的下标)。表格和目录树都走这里。"""
+        if self.btn_view.isChecked():
+            node = self.tree.currentItem()
+            if node is None:
+                return None, -1
+            idx = node.data(0, Qt.UserRole)
+            if isinstance(idx, int) and 0 <= idx < len(self._shown or []):
+                return self._shown[idx], idx
+            return None, -1
+        row = self.table.currentRow()
+        if row < 0:
+            return None, -1
+        return self.table.payload_at(row), row
+
+    def _on_row_pick(self):
+        if self.table.currentRow() >= 0:
+            self.preview.show()
+            self._pv_timer.start()
+
+    def _on_tree_pick(self, cur, _prev):
+        if cur is not None and isinstance(cur.data(0, Qt.UserRole), int):
+            self.preview.show()
+            self._pv_timer.start()
+
+    def _load_preview(self):
+        item, _idx = self._current_pick()
+        if item is None:
+            return
+        cached = self._pv_hits.get(id(item))
+        if cached is not None:
+            self.preview.show_item(item, cached)
+            return
+        self.preview.show_loading(item)
+        self._pv_token += 1
+        job = PreviewJob(self._pv_token, item,
+                         letter=self._letter or self._image_letter or "",
+                         image=self._image or "", image_base=self._image_base)
+        job.signals.done.connect(self._pv_on_loaded)
+        QThreadPool.globalInstance().start(job)
+
+    def _pv_on_loaded(self, token, item, info):
+        # 按着方向键连翻的时候会有好几个请求同时在飞，只认最后一个
+        if token != self._pv_token:
+            return
+        self._pv_hits[id(item)] = info
+        if len(self._pv_hits) > 600:
+            self._pv_hits.clear()
+        cur, _idx = self._current_pick()
+        if cur is not item:
+            return
+        self.preview.show_item(item, info)
+        if item.get("path"):
+            self._refresh_path_cell(item)
+
+    def open_preview(self):
+        """双击 / 「看大图…」：把这一条放大看，← → 能翻上下一个。"""
+        item, idx = self._current_pick()
+        if item is None:
+            return
+        dlg = PreviewDialog(self, self._shown or [item], max(idx, 0),
+                            letter=self._letter or self._image_letter or "",
+                            image=self._image or "", image_base=self._image_base)
+        dlg.exec()
+
     def _on_counts(self, sel, total):
         self.lb_sel.setText(f"已勾 {sel} / {total}")
         self.btn_restore.setEnabled(sel > 0 and not self.is_busy())
@@ -5753,16 +5866,31 @@ class RecoveryPage(Page):
         items = getattr(self, "_items", None) or []
         if not items:
             self.bar_filter.hide()
+            self.preview.clear()
+            self.preview.hide()
             return
-        shown = catalog.filter_items(
+        matched = catalog.filter_items(
             items,
             kind=self.cb_kind.currentData() or "",
             days=int(self.cb_time.currentData() or 0),
             keyword=self.ed_kw.text())
+        # 盘里认出十几万条是常事。既不截断丢掉（用户找不到「更老的」那些），
+        # 也不一次全摆进 QTableWidget（几万行建表要好几秒、滚动也卡）：
+        # 先摆最新的一批，底部「多看 N 条」一批批往下加。
+        self._matched = len(matched)
+        shown = matched[:self._view_limit]
         self._shown = shown
         self.bar_filter.show()
-        self.lb_count.setText(f"显示 {len(shown)} / 共 {len(items)} 条"
-                              if len(shown) != len(items) else f"共 {len(items)} 条")
+        if self._matched > len(shown):
+            self.lb_count.setText(
+                f"显示前 {len(shown)} 条，共 {self._matched} 条（最新的在前）")
+            self.btn_more.setText(f"多看 {VIEW_STEP} 条")
+            self.btn_more.show()
+        else:
+            self.lb_count.setText(
+                f"共 {len(items)} 条" if self._matched == len(items)
+                else f"显示 {self._matched} / 共 {len(items)} 条")
+            self.btn_more.hide()
 
         keep = {id(p) for p in self.table.checked_payloads()}
         rows, payloads = [], []
@@ -5775,8 +5903,7 @@ class RecoveryPage(Page):
                 ("—" if unknown_size
                  else (fb(it.get("size") or 0) if not it.get("is_dir") else "文件夹"),
                  it.get("size") or 0),
-                (it.get("path") or "") + (
-                    f"（另有 {len(it['links'])} 个硬链接）" if it.get("links") else ""),
+                self._path_text(it),
                 it.get("deleted") or it.get("mtime") or "",
                 recovery.CONFIDENCE.get(conf, conf),
             ])
@@ -5795,7 +5922,51 @@ class RecoveryPage(Page):
             self._fresh = False
         if self.btn_view.isChecked():
             self._rebuild_tree(shown)
+        elif self.table.currentRow() < 0:
+            self.preview.clear()
+            self.preview.hide()
         self._on_counts(len(self.table.checked_payloads()), len(shown))
+
+    def _reset_view(self, *_args):
+        """筛选条件变了：回到第一批（不然用户改完筛选还停在第 8 万条的位置）。"""
+        self._view_limit = VIEW_STEP
+        self._apply_filter()
+
+    def _show_more(self):
+        """再摆一批。已经摆到底就提示一句，别让按钮点着没反应。"""
+        if self._view_limit >= self._matched:
+            self.btn_more.hide()
+            return
+        self._view_limit += VIEW_STEP
+        self._apply_filter()
+        # 滚到新出现的第一条，用户才知道「更多」在哪儿
+        first_new = max(0, self._view_limit - VIEW_STEP)
+        if first_new < self.table.rowCount():
+            self.table.scrollToItem(self.table.item(first_new, 1),
+                                    QAbstractItemView.PositionAtTop)
+
+    def _path_text(self, it):
+        """表格里「原位置」这一格显示什么。
+
+        扫描时为省时间，只有最新那批算了原路径（15 万条全算要 57 秒）。
+        没算的这里说明白，别显示成空白让人以为「这个文件没有原位置」。
+        """
+        path = it.get("path") or ""
+        if path:
+            return path + (f"（另有 {len(it['links'])} 个硬链接）"
+                           if it.get("links") else "")
+        if isinstance(it.get("idx"), int) and it["idx"] > 0:
+            return "（点这一行就能读出原位置）"
+        return ""
+
+    def _refresh_path_cell(self, item):
+        """预览时顺手补出了原路径 → 把表格那一格也更新掉。"""
+        for row, it in enumerate(self._shown or []):
+            if it is item:
+                cell = self.table.item(row, 3)      # 列：勾选/名称/大小/原位置…
+                if cell is not None:
+                    cell.setText(self._path_text(item))
+                return
 
     def _toggle_view(self, on):
         """列表 / 按目录 二选一。

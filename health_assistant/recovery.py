@@ -93,6 +93,9 @@ CONFIDENCE = {
     "compressed": "NTFS 压缩文件（会自动解压后导出）",
     "encrypted": "EFS 加密文件，本工具不能解密",
     "dir": "文件夹（只恢复目录）",
+    # 只做了「不读盘」的初判（记录还在、有数据位置），还没核对内容。
+    # 不写成 good：没核过就说能恢复，和 4.12.0 定的规矩冲突。
+    "unverified": "还没核对内容（点它就能看）",
 }
 
 # 文件头魔数：只用来**校验**「内容像不像这个名字说的东西」，不是用来找文件的。
@@ -1291,6 +1294,36 @@ class _ImageReader:
             self._fh = None
 
 
+class BareImageVolume:
+    """裸数据镜像的只读视图：没有引导扇区，只按字节读。
+
+    为什么需要：`dd` 出来的镜像、别人给的分区镜像、甚至只是一段被拷出来的数据，
+    开头都不是某个文件系统的引导扇区。这种镜像按类型找照样能救东西 ——
+    以前这类文件会被当成盘符去扫（`"D://x.img"` → `"D:"`），扫错对象还浑然不觉。
+    """
+
+    def __init__(self, path, base=0):
+        self.letter = "镜像"
+        self.path = path
+        self._raw = _ImageReader(path, base=base)
+        self.base = self._raw.base
+        self.kind = "unknown"
+        self.total_bytes = self._raw.size
+        self.bytes_per_sector = SECTOR
+        self.cluster = 4096
+        self.total_sectors = self.total_bytes // SECTOR
+
+    def read(self, offset, size):
+        return self._raw.read(offset, size)
+
+    def cluster_used(self, _lcn):
+        """看不到位图 —— 返回 None，让调用方知道「这里是盲的」（界面会标出来）。"""
+        return None
+
+    def close(self):
+        self._raw.close()
+
+
 class ImageVolume(NtfsVolume):
     """以只读方式打开一份「整卷镜像」（`image_volume()` 写出来的 .pciimg）。
 
@@ -1314,12 +1347,18 @@ class ImageVolume(NtfsVolume):
 
 # ───────────────────────── 扫描已删除文件 ─────────────────────────
 
-def scan_deleted(vol, limit=2000, budget=None, progress=None, cancel=None,
-                 progress2=None):
+def scan_deleted(vol, limit=None, budget=None, progress=None, cancel=None,
+                 progress2=None, verify=20000, path_limit=30000):
     """扫 MFT（NTFS）或目录树（FAT/exFAT），列出已删除的文件/文件夹（**只读**）。
 
     `vol` 可以是盘符（'C:'）也可以是已经打开的卷对象。
-    `limit`：返回条数上限（默认 2000，界面一次列 10 万条也没人看）。
+    `limit`：返回条数上限（**默认 None = 全部**）。以前默认 2000 / 上限 2 万，
+    用户看到的是「只有这么多」，其实盘里有十几万条 —— 上限不该伪装成全部。
+    `path_limit`：算「原位置」的条数（每条要随机读祖先目录，实测 15.8 万条要 57 秒），
+    默认最近 3 万条；其余留空，点开那一条时再补（那时卷已经打开了，补一条只要几毫秒）。
+    `verify`：逐条核对内容（要读盘，每条约 0.3ms）的条数，默认最近 2 万条。
+    超出部分标成 `unverified`（记录还在、有数据位置），界面照样列出来，
+    点它一下就能看到内容 —— 比「悄悄砍掉」诚实，也比全量核对快得多。
     `budget`：秒数预算（NTFS 默认 90 秒；FAT 走目录树，默认 120 秒）。
     `progress(已扫记录, 总记录)`；`cancel()` 返回 True 就提前收工。
     返回 `(条目列表, 统计 dict)`。
@@ -1336,7 +1375,7 @@ def scan_deleted(vol, limit=2000, budget=None, progress=None, cancel=None,
         if kind in ("exfat", "fat32", "fat"):
             from . import fatfs
             return fatfs.scan_deleted(
-                vol, limit=max(limit, 1000),
+                vol, limit=max(limit or 200000, 1000),
                 budget=budget if budget is not None else 120,
                 progress=progress, cancel=cancel)
     try:
@@ -1344,7 +1383,7 @@ def scan_deleted(vol, limit=2000, budget=None, progress=None, cancel=None,
         if is_fat(vol):
             from . import fatfs
             return fatfs.scan_deleted(
-                vol, limit=max(limit, 1000),
+                vol, limit=max(limit or 200000, 1000),
                 budget=budget if budget is not None else 120,
                 progress=progress, cancel=cancel)
     except ImportError:
@@ -1434,24 +1473,35 @@ def scan_deleted(vol, limit=2000, budget=None, progress=None, cancel=None,
         # 位图判定（「簇是不是已经给别人了」）只对留下的这些做：全量 6 万条 × 每条例行
         # 抽样会把扫描时间翻几倍，而用户真正会勾的就是最近删的那几百条。
         cands.sort(key=lambda c: -c["_t"])
-        keep = cands[:max(limit, 200)]
+        keep = cands if limit is None else cands[:max(limit, 200)]
         order = {"good": 0, "dir": 1, "risky": 2, "compressed": 3, "encrypted": 4,
-                 "no_data": 5}
-        # 逐个核对「内容还在不在」要读盘（每条抽 4 段），2 万条要十几秒 ——
-        # 这段时间不报进度的话，界面看起来就是卡死了。
-        for i, it in enumerate(keep):
+                 "no_data": 5, "unverified": 6}
+        n_verify = len(keep) if verify is None else min(verify, len(keep))
+        # 逐个核对「内容还在不在」要读盘（每条抽 4 段）：2 万条约 20 秒，
+        # 15 万条要 3 分钟 —— 这段时间不报进度的话，界面看起来就是卡死了。
+        for i, it in enumerate(keep[:n_verify]):
             it["confidence"] = _confidence(v, it)
             if progress2 and i % 256 == 0:
-                progress2(i, len(keep))
+                progress2(i, max(n_verify, 1))
         if progress2:
-            progress2(len(keep), len(keep))
+            progress2(n_verify, max(n_verify, 1))
+        # 没核对的照实标出来，不冒充 good，也不从列表里删掉
+        for it in keep[n_verify:]:
+            it["confidence"] = "unverified"
         keep.sort(key=lambda c: (order.get(c["confidence"], 9), -c["_t"]))
-        items = keep[:limit]
+        items = keep if limit is None else keep[:limit]
 
-        # 原路径要随机读祖先目录，也只给最终列出来的这些算
+        # 原路径要随机读祖先目录：15.8 万条实测 57 秒，而界面一次只摆 2000 条。
+        # 只给最近 path_limit 条算，其余留空 —— 点开某条时再补（那时卷已经打开，
+        # 补一条只要几毫秒）。这里不假装「原目录已不在」，留空就是留空。
         cache = {}
-        for it in items:
-            it["path"] = v.path_of(it["idx"], cache)
+        missing = 0
+        for i, it in enumerate(items):
+            if path_limit is not None and i >= path_limit:
+                it["path"] = ""
+                missing += 1
+            else:
+                it["path"] = v.path_of(it["idx"], cache)
             it["cluster_count"] = sum(c for _l, c, _sp in it["runs"])
             it.pop("_t", None)
 
@@ -1463,6 +1513,8 @@ def scan_deleted(vol, limit=2000, budget=None, progress=None, cancel=None,
             "elapsed": round(time.time() - t0, 1),
             "found": len(items),
             "candidates": len(cands),
+            "unverified": max(0, len(items) - n_verify),
+            "path_missing": missing,
             "good": sum(1 for i in items if i["confidence"] == "good"),
             "risky": sum(1 for i in items if i["confidence"] == "risky"),
         }
@@ -1470,6 +1522,70 @@ def scan_deleted(vol, limit=2000, budget=None, progress=None, cancel=None,
     finally:
         if own:
             v.close()
+
+
+def complete_runs(vol, item):
+    """把「runlist 被拆到 `$ATTRIBUTE_LIST` 扩展记录」的碎片文件补全 → True。
+
+    为什么需要：MFT 记录只有 1KB，一条**重度碎片化**的文件（runlist 长到装不下）
+    会把后半截 runlist 写进扩展记录。只读主记录的话，恢复出来只有文件的前一段，
+    或者被 `_confidence` 判成「段不全」。而这类文件恰恰是用户最想救的那一类。
+
+    **只在「现有 runs 明显装不下」时才去读扩展记录**：全量扫描 15 万条时每条都
+    多读几条 MFT 记录，扫描时间会翻倍，而绝大多数文件的 runlist 本来就装得下。
+
+    这个补全是**确定性的**：runlist 就是文件系统自己记的「这段数据在哪儿」，
+    拼出来的字节和原件逐字节相同（`_test_fragment.py` 里 MP4 用例验证的就是
+    「多段拼接后逐字节一致」这件事）。
+    """
+    if not item or item.get("is_dir") or item.get("resident"):
+        return False
+    if item.get("runs_from_attrlist"):
+        return True
+    runs = item.get("runs") or []
+    size = int(item.get("size") or 0)
+    cluster = getattr(vol, "cluster", 4096) or 4096
+    if not size or not runs or vol is None:
+        return False
+    have = sum(c for _l, c, _s in runs) * cluster
+    if have + cluster >= size:
+        return False                        # 装得下，不用折腾
+    idx = item.get("idx")
+    if not isinstance(idx, int) or idx <= 0 or not hasattr(vol, "record"):
+        return False
+    try:
+        rec = vol.record(idx)
+        if not rec:
+            return False
+        data = parse_data_full(vol, rec)
+    except Exception:                       # noqa: BLE001
+        return False
+    if not data or not data.get("runs"):
+        return False
+    got = data["runs"]
+    if sum(c for _l, c, _s in got) * cluster <= have:
+        return False                        # 扩展记录也补不出更多，别自欺欺人
+    item["runs"] = got
+    item["runs_from_attrlist"] = True
+    return True
+
+
+def fill_path(vol, item, cache=None):
+    """给一条结果补上「原位置」（扫描时为了省时间没算的那些）。
+
+    只在卷已经打开的时候调 —— 单独为了一条路径去开卷不值得，
+    但恢复和预览本来就要读这块盘，顺手就补了。
+    """
+    if item.get("path") or vol is None:
+        return item.get("path") or ""
+    idx = item.get("idx")
+    if not isinstance(idx, int) or idx <= 0 or not hasattr(vol, "path_of"):
+        return ""
+    try:
+        item["path"] = vol.path_of(idx, cache if cache is not None else {})
+    except Exception:                                   # noqa: BLE001
+        return ""
+    return item["path"]
 
 
 def _magic_verdict(name, head):
@@ -1604,7 +1720,10 @@ def _confidence(vol, item):
     size = int(item.get("size") or 0)
     cap = sum(c for _l, c, _s in runs) * vol.cluster
     if size and cap and cap + vol.cluster < size:
-        return "risky"                 # 段不全，拼出来一定是残缺文件
+        # runlist 装不下真实大小：可能被拆到 $ATTRIBUTE_LIST 里了（重度碎片）。
+        # 先试着补全，补得出来就继续按完整的段判，补不出来才说「段不全」。
+        if not complete_runs(vol, item):
+            return "risky"
 
     quick = _confidence_quick(vol, item)
     if quick == "risky":
@@ -1725,8 +1844,11 @@ def recover_one(vol, item, target_dir, keep_tree=True, progress=None, cancel=Non
             fh.write(item.get("data_off") or b"")
         return dest
 
-    runs = [r for r in (item.get("runs") or [])]
     total = int(item.get("size") or 0)
+    # 重度碎片化的文件，runlist 可能被拆到扩展记录里 —— 只按主记录恢复会少写后半段。
+    # complete_runs 只在「现有 runs 明显装不下」时才去读扩展记录，正常文件不受影响。
+    complete_runs(v, item)
+    runs = [r for r in (item.get("runs") or [])]
 
     if item.get("compressed"):
         # 压缩文件必须整块解完才能写（LZNT1 的引用跨 chunk，不能流式拼接）。
@@ -2755,7 +2877,8 @@ _KIND_ALIAS = {"jpg": "jpeg", "jpe": "jpeg", "tif": "tiff", "doc": "cfb", "xls":
 
 
 def carve(vol, out_dir, kinds=None, budget_bytes=None, max_file=None,
-          max_files=5000, progress=None, cancel=None, groups=None, min_size=None):
+          max_files=5000, progress=None, cancel=None, groups=None, min_size=None,
+          image_base=0):
     """在未分配空间里按文件类型找（carving），直接写到 `out_dir`。
 
     **只在目录区也没了的时候用**：格式化、分区表坏、MFT 被清、甚至根本不是 NTFS。
@@ -2766,14 +2889,31 @@ def carve(vol, out_dir, kinds=None, budget_bytes=None, max_file=None,
       不再「看到文件头就当找到、切出来一半」；
     * 默认扫**整个未分配区**（不是前 512MB），可以随时停，进度条按字节走；
     * 结果默认最多 5000 个（以前 120 个），同内容只留一份；
-    * 每个结果都带 verdict：结构完整走到尾的算 ok，只能走到「结构不再自洽」的算 weak。
+    * 每个结果都带 verdict：结构完整走到尾的算 ok，只能走到「结构不再自洽」的算 weak，
+      **文件在盘上被拆成几段的算 fragment**（4.19.0 起：MP4 的 moov 被切到后面时
+      会去把它捞回来，中间缺的按空白补齐，交出来的文件能打开、只有缺的那段是花的）。
 
     `groups` 可按大类缩小范围：photo/doc/media/archive/other（只扫需要的类更快）。
+    `vol` 除了盘符和卷对象，也可以直接给**镜像文件路径**（会按镜像打开）。
     """
     from . import carving
     from .fatfs import is_fat
-    own = not isinstance(vol, (NtfsVolume, BareVolume)) and not is_fat(vol)
-    v = open_volume(vol)[0] if own else vol
+    if isinstance(vol, str) and os.path.isfile(vol):
+        # 传进来的是镜像文件，不是盘符。这里必须自己识别 ——
+        # 以前会把它当盘符处理，"D:\x\disk.img" 被截成 "D:"，
+        # 于是**悄悄扫了整个 D 盘**（实测 12MB 的镜像扫了十分钟还没完，
+        # 而且进度条上写着 706GB）。这种错误用户根本看不出来。
+        try:
+            v, _kind = open_image_volume(vol, base=image_base)
+        except Exception:                   # noqa: BLE001
+            # 没有引导扇区的裸数据镜像（dd 出来的、只拷了一段数据的）也能扫。
+            # 这里故意连「不是 NTFS」一起接住：按类型找本来就不看文件系统，
+            # 能读到字节就够了。
+            v = BareImageVolume(vol, base=image_base)
+        own = True
+    else:
+        own = not isinstance(vol, (NtfsVolume, BareVolume)) and not is_fat(vol)
+        v = open_volume(vol)[0] if own else vol
     ids = None
     if kinds:
         ids = []

@@ -611,7 +611,7 @@ class RecoveryScanTask(BaseTask):
             self.progress.emit(0, 3, "第 2 步 / 3：扫磁盘上的已删除记录…")
             try:
                 items2, st2 = recovery.scan_deleted(
-                    src, limit=20000,
+                    src, limit=None,
                     progress=lambda i, n: None if self._stop else self.progress.emit(
                         i, max(n, 1), "第 2 步 / 3：正在扫已删除记录…"),
                     progress2=lambda i, n: None if self._stop else self.progress.emit(
@@ -673,7 +673,7 @@ class RecoveryScanTask(BaseTask):
             out["stats"] = {"found": len(out["items"])}
         elif self.mode == "mft":
             items, st = recovery.scan_deleted(
-                src, limit=20000,
+                src, limit=None,
                 progress=lambda i, n: None if self._stop else self.progress.emit(
                     i, n, "正在扫磁盘上的已删除记录…"),
                 progress2=lambda i, n: None if self._stop else self.progress.emit(
@@ -748,11 +748,16 @@ class RecoveryRestoreTask(BaseTask):
                 else:
                     # 恢复也要按真实文件系统开（FAT / exFAT 的 runs 和 NTFS 同构）
                     vol = recovery.open_volume(self.letter)[0]
+            path_cache = {}
             for i, item in enumerate(self.items, 1):
                 if self._stop:
                     break
                 self.progress.emit(i, len(self.items),
                                    f"正在恢复 {item.get('name', '')}")
+                # 扫描时为省时间没算的那部分原路径，现在卷已经打开了，顺手补上，
+                # 否则恢复出来会平铺在目标目录里，原来的目录结构就没了。
+                if vol is not None and self.mode in ("mft", "raw"):
+                    recovery.fill_path(vol, item, path_cache)
                 try:
                     if self.mode == "recycle":
                         dest = recovery.restore_recycle(item, self.target)
