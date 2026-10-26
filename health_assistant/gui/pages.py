@@ -5190,6 +5190,13 @@ class RecoveryPage(Page):
         self.preview.clear()
         self.preview.hide()
         self._pv_hits.clear()
+        # 上一次的结果也清掉：不清的话「边扫边出」的新行会接在上一块盘的旧结果后面，
+        # 用户分不清哪条是这次扫出来的。清完立刻能看见新扫到的第一条。
+        self._items = []
+        self._shown = []
+        self._matched = 0
+        self._view_limit = VIEW_STEP
+        self.table.set_check_rows([], [], checked=False)
         if self.is_busy():
             return
         letter = self._letter
@@ -5239,6 +5246,7 @@ class RecoveryPage(Page):
                                           parent=self))
         task.progress.connect(self._on_progress)
         task.failed.connect(self._on_fail)
+        task.partial.connect(self._on_partial)
         task.done.connect(self._on_found)
         task.finished.connect(self._on_finished)
         task.start()
@@ -5272,6 +5280,39 @@ class RecoveryPage(Page):
         self.btn_stop.setEnabled(False)
         self.btn_image.setEnabled(True)
         self.btn_open_img.setEnabled(True)
+
+    def _on_partial(self, payload):
+        """边扫边往列表里加。扫完那一刻会被整体换成核对过的结果。
+
+        为什么值得做：一次扫盘 20~90 秒、格式化恢复几分钟。以前这段时间列表是空的，
+        只剩一句「正在查找…」，用户不知道盘里到底有没有东西，很容易当成卡死然后强杀。
+        现在第一批通常一秒内就出来，「有东西 / 没东西」立刻能看出来。
+
+        两条纪律：
+          · 这些条目**还没核对内容、也没算出原目录**，评级写「刚扫到，还没核对」，
+            绝不冒充「能恢复」；
+          · 有筛选条件或正在看目录树时不往表格里塞（每来一批就把十几万条重排一遍
+            会把界面拖死），只更新条数，扫完统一重建一次。
+        """
+        items = payload.get("items") or []
+        if not items:
+            return
+        self._items.extend(items)
+        n = len(self._items)
+        filtering = bool(self.cb_kind.currentData()
+                         or int(self.cb_time.currentData() or 0)
+                         or self.ed_kw.text().strip())
+        room = self._view_limit - len(self._shown)
+        if filtering or self.btn_view.isChecked() or room <= 0:
+            self.lb_count.setText(f"已经扫到 {n} 条，还在扫…")
+            return
+        new = items[:room]
+        self._shown.extend(new)
+        self.bar_filter.show()
+        self.empty.setVisible(False)
+        self.table.setVisible(True)
+        self.table.append_check_rows([self._row_of(it) for it in new], new)
+        self.lb_count.setText(f"已经扫到 {n} 条，还在扫…")
 
     def _on_found(self, payload):
         mode = payload.get("mode")
@@ -5569,7 +5610,9 @@ class RecoveryPage(Page):
             return
         path, _flt = QFileDialog.getOpenFileName(
             self, "打开之前做的镜像", self._default_image_dir(),
-            "镜像文件 (*.pciimg *.img *.dd *.raw *.bin *.vhd *.vhdx *.vmdk);;"
+            "镜像文件 (*.pciimg *.img *.dd *.raw *.bin *.vhd *.vhdx *.vmdk "
+            "*.E01 *.e01 *.E02 *.e02 *.Ex01 *.ex01);;"
+            "取证镜像 E01 (*.E01 *.e01 *.Ex01 *.ex01);;"
             "虚拟盘 (*.vhd *.vhdx *.vmdk);;所有文件 (*.*)")
         if not path:
             return
@@ -5629,9 +5672,12 @@ class RecoveryPage(Page):
                 "扫描照常可以做，只是不能断点续传、原盘符也未知。")
         self._set_image(path, letter, base=base, part=part)
         vkind = getattr(probe, "label", "") or ""
+        knote = getattr(probe, "note", "")
+        if knote:
+            vkind = f"{vkind}，{knote}" if vkind else knote
         if vkind and vkind != "整盘镜像":
-            # 用户给的是虚拟盘（VHD/VHDX/VMDK）：告诉他工具已经把格式解开了，
-            # 免得他以为「我拿的是 .vhdx，你怎么当裸数据读」。
+            # 用户给的是虚拟盘或取证镜像（VHD/VHDX/VMDK/E01）：告诉他工具已经把
+            # 外面的壳解开了，免得他以为「我拿的是 .vhdx / .E01，你怎么当裸数据读」。
             self.lb_src.setText(self.lb_src.text() + f"　（已解开：{vkind}）")
         if base:
             self.lb_src.setText(self.lb_src.text() +
@@ -5905,22 +5951,8 @@ class RecoveryPage(Page):
             self.btn_more.hide()
 
         keep = {id(p) for p in self.table.checked_payloads()}
-        rows, payloads = [], []
-        for it in shown:
-            conf = it.get("confidence") or ""
-            # 只有名字的条目（USN / INDX）不知道大小，显示「0B」会被当成空文件
-            unknown_size = (conf == "name_only" and not it.get("size"))
-            rows.append([
-                it.get("name") or "",
-                ("—" if unknown_size
-                 else (fb(it.get("size") or 0) if not it.get("is_dir") else "文件夹"),
-                 it.get("size") or 0),
-                self._path_text(it),
-                it.get("deleted") or it.get("mtime") or "",
-                recovery.CONFIDENCE.get(conf, conf),
-            ])
-            payloads.append(it)
-        self.table.set_check_rows(rows, payloads, checked=False)
+        self.table.set_check_rows([self._row_of(it) for it in shown],
+                                  list(shown), checked=False)
         for i, p in enumerate(shown):
             if id(p) in keep:
                 self.table.set_row_checked(i, True)
@@ -5956,6 +5988,21 @@ class RecoveryPage(Page):
         if first_new < self.table.rowCount():
             self.table.scrollToItem(self.table.item(first_new, 1),
                                     QAbstractItemView.PositionAtTop)
+
+    def _row_of(self, it):
+        """一条结果 → 表格里的一行。边扫边追加和扫完重建都走这里，两处不许长歪。"""
+        conf = it.get("confidence") or ""
+        # 只有名字的条目（USN / INDX）不知道大小，显示「0B」会被当成空文件
+        unknown_size = (conf == "name_only" and not it.get("size"))
+        return [
+            it.get("name") or "",
+            ("—" if unknown_size
+             else (fb(it.get("size") or 0) if not it.get("is_dir") else "文件夹"),
+             it.get("size") or 0),
+            self._path_text(it),
+            it.get("deleted") or it.get("mtime") or "",
+            recovery.CONFIDENCE.get(conf, conf),
+        ]
 
     def _path_text(self, it):
         """表格里「原位置」这一格显示什么。

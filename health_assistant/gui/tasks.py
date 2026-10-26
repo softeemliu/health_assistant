@@ -524,6 +524,7 @@ class RecoveryScanTask(BaseTask):
     """
 
     done = Signal(object)
+    partial = Signal(object)        # 边扫边出的一批（{"items": [...], "stage": 名字}）
 
     def __init__(self, mode, letter, target=None, budget=None, deep=False,
                  image=None, image_base=0, groups=None, parent=None):
@@ -537,12 +538,35 @@ class RecoveryScanTask(BaseTask):
         self.image_base = image_base    # 整盘镜像里卷首的字节偏移（0 = 从文件头开始）
         self.groups = groups            # 按类型找时只找这些大类（None = 全部）
         self._stop = False
+        self._stream_keys = set()       # 已经推给界面的记录号（同一块盘多路扫会重）
 
     def stop(self):
         self._stop = True
 
     def stopped(self):
         return self._stop
+
+    def _batch(self, tag):
+        """给 recovery 的 on_batch 用：同一批里去重后通过 partial 信号发给界面。
+
+        为什么要在这里去重：`auto` 模式会先扫已删除记录、必要时再深挖格式化残留，
+        后一路会把前一路扫到过的记录再交一遍。列表那边是靠「记录号」去重的，
+        边扫边显示也得同样处理，否则用户会看到同一行出现两次。
+        """
+        def sink(batch):
+            if self._stop:
+                return
+            out = []
+            for it in batch:
+                idx = it.get("idx")
+                if isinstance(idx, int):
+                    if idx in self._stream_keys:
+                        continue
+                    self._stream_keys.add(idx)
+                out.append(it)
+            if out:
+                self.partial.emit({"items": out, "stage": tag})
+        return sink
 
     def work(self):
         out = {"mode": self.mode, "letter": self.letter, "items": [], "stats": {},
@@ -611,7 +635,7 @@ class RecoveryScanTask(BaseTask):
             self.progress.emit(0, 3, "第 2 步 / 3：扫磁盘上的已删除记录…")
             try:
                 items2, st2 = recovery.scan_deleted(
-                    src, limit=None,
+                    src, limit=None, on_batch=self._batch("已删除记录"),
                     progress=lambda i, n: None if self._stop else self.progress.emit(
                         i, max(n, 1), "第 2 步 / 3：正在扫已删除记录…"),
                     progress2=lambda i, n: None if self._stop else self.progress.emit(
@@ -630,7 +654,7 @@ class RecoveryScanTask(BaseTask):
             self.progress.emit(0, 3, "第 3 步 / 3：深挖格式化后的残留（慢，可随时停）…")
             try:
                 items3, st3 = recovery.metadata_scan(
-                    src,
+                    src, on_batch=self._batch("格式化残留"),
                     budget=self.budget or (900 if self.deep else 180),
                     only_free=not self.deep, limit=None,
                     progress=lambda i, n, text: None if self._stop else self.progress.emit(
@@ -674,7 +698,7 @@ class RecoveryScanTask(BaseTask):
             out["stats"] = {"found": len(out["items"])}
         elif self.mode == "mft":
             items, st = recovery.scan_deleted(
-                src, limit=None,
+                src, limit=None, on_batch=self._batch("已删除记录"),
                 progress=lambda i, n: None if self._stop else self.progress.emit(
                     i, n, "正在扫磁盘上的已删除记录…"),
                 progress2=lambda i, n: None if self._stop else self.progress.emit(
@@ -685,7 +709,7 @@ class RecoveryScanTask(BaseTask):
         elif self.mode == "raw":
             # 格式化/目录全丢：扫盘上的残留旧记录 + 目录索引（两路合并，能带回原名和目录）
             items, st = recovery.metadata_scan(
-                src,
+                src, on_batch=self._batch("格式化残留"),
                 # 整卷扫描按专业软件的路子给足时间：几百 GB 扫几个小时很正常
                 budget=self.budget or (900 if self.deep else 180),
                 only_free=not self.deep, limit=None,

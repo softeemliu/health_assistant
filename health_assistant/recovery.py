@@ -100,6 +100,8 @@ CONFIDENCE = {
     # 只做了「不读盘」的初判（记录还在、有数据位置），还没核对内容。
     # 不写成 good：没核过就说能恢复，和 4.12.0 定的规矩冲突。
     "unverified": "还没核对内容（点它就能看）",
+    # 还在扫：这一条是「边扫边列出来」的，扫完会被换成真实评级。
+    "pending": "刚扫到，还没核对",
 }
 
 # 文件头魔数：只用来**校验**「内容像不像这个名字说的东西」，不是用来找文件的。
@@ -1344,6 +1346,7 @@ class _ImageReader:
             raise RecoverError(str(exc)) from exc
         self.kind = self._disk.kind
         self.label = self._disk.label
+        self.note = getattr(self._disk, "note", "")   # 例如「3 个分卷」「少 9 块」
         self.size = max(0, self._disk.size - self.base)
 
     def read(self, offset, size):
@@ -1415,6 +1418,7 @@ class ImageVolume(NtfsVolume):
         self._bitmap_lock = threading.Lock()
         # 「整盘镜像」还是「VHDX 动态盘」—— 界面要如实告诉用户工具帮他解开了什么
         self.label = getattr(self._raw, "label", "整盘镜像")
+        self.note = getattr(self._raw, "note", "")
         try:
             self._parse_boot()
         except Exception:
@@ -1490,8 +1494,44 @@ def _pmap(fn, seq, progress=None, workers=None):
 
 # ───────────────────────── 扫描已删除文件 ─────────────────────────
 
+class _Streamer:
+    """把「边扫边出的条目」攒成批交给界面：攒够 256 条、或过了 0.35 秒就发一次。
+
+    为什么要它：一次扫盘动辄 20~90 秒（格式化恢复几分钟），以前这段时间界面只有
+    一句「正在查找…」，用户不知道盘里到底有没有东西、还要等多久，很容易当成卡死
+    然后强杀。商业软件都是**边扫边往列表里加**的，这里补上。
+
+    攒批而不是来一条发一条：跨线程信号有成本，十几万条逐条发会把扫描拖慢。
+    界面那边抛异常也绝不能把扫描带崩 —— 出错就停止推送，扫描继续。
+    """
+
+    def __init__(self, sink, every=256, interval=0.35):
+        self.sink = sink
+        self.every = max(1, int(every))
+        self.interval = interval
+        self.buf = []
+        self.t = time.time()
+
+    def add(self, item):
+        if self.sink is None:
+            return
+        self.buf.append(item)
+        if len(self.buf) >= self.every or (time.time() - self.t) >= self.interval:
+            self.flush()
+
+    def flush(self):
+        if not self.buf or self.sink is None:
+            return
+        batch, self.buf = self.buf, []
+        self.t = time.time()
+        try:
+            self.sink(batch)
+        except Exception:                      # noqa: BLE001
+            self.sink = None                   # 界面出事不能影响扫描本身
+
+
 def scan_deleted(vol, limit=None, budget=None, progress=None, cancel=None,
-                 progress2=None, verify=20000, path_limit=30000):
+                 progress2=None, verify=20000, path_limit=30000, on_batch=None):
     """扫 MFT（NTFS）或目录树（FAT/exFAT），列出已删除的文件/文件夹（**只读**）。
 
     `vol` 可以是盘符（'C:'）也可以是已经打开的卷对象。
@@ -1502,6 +1542,9 @@ def scan_deleted(vol, limit=None, budget=None, progress=None, cancel=None,
     `verify`：逐条核对内容（要读盘，每条约 0.3ms）的条数，默认最近 2 万条。
     超出部分标成 `unverified`（记录还在、有数据位置），界面照样列出来，
     点它一下就能看到内容 —— 比「悄悄砍掉」诚实，也比全量核对快得多。
+    `on_batch(条目列表)`：边扫边出的回调，每攒一批叫一次（不给就只是最后一次性返回）。
+    这里交出去的条目**还没核对内容、也没算原目录**（`confidence="pending"`），
+    它们和最终结果是同一批 dict 对象，后面会被就地补全。
     `budget`：秒数预算（NTFS 默认 90 秒；FAT 走目录树，默认 120 秒）。
     `progress(已扫记录, 总记录)`；`cancel()` 返回 True 就提前收工。
     返回 `(条目列表, 统计 dict)`。
@@ -1540,6 +1583,7 @@ def scan_deleted(vol, limit=None, budget=None, progress=None, cancel=None,
         t0 = time.time()
         budget_s = budget if budget is not None else 90
         cands = []
+        stream = _Streamer(on_batch)
         scanned = 0
         truncated = False
         for idx, rec in v.iter_records():
@@ -1590,7 +1634,9 @@ def scan_deleted(vol, limit=None, budget=None, progress=None, cancel=None,
                 "data_off": (data or {}).get("value", b"") if (data and data["resident"]) else b"",
                 "letter": v.letter,
                 "links": links,
+                "confidence": "pending",     # 还没核对内容；最终会被就地改成真实评级
             })
+            stream.add(cands[-1])
             # 命名数据流（ADS）也列出来，名字写成「文件:流名」，导出时 `:` 会被
             # safe_name 换成 `_`，落到盘上是 `文件_流名`，不和主文件撞名。
             for ad in parse_named_streams(rec):
@@ -1610,7 +1656,10 @@ def scan_deleted(vol, limit=None, budget=None, progress=None, cancel=None,
                     "data_off": ad["value"] if ad["resident"] else b"",
                     "letter": v.letter,
                     "stream": ad["name"],
+                    "confidence": "pending",
                 })
+                stream.add(cands[-1])
+        stream.flush()
         progress and progress(scanned, total)
 
         # 位图判定（「簇是不是已经给别人了」）只对留下的这些做：全量 6 万条 × 每条例行
@@ -2934,7 +2983,7 @@ def _merge_items(recs, indx, vol, limit=None, usn=None):
 
 def metadata_scan(letter, budget=None, limit=None, progress=None, cancel=None,
                   only_free=True, block=8 << 20, with_index=True,
-                  with_usn=True, with_meta=True, verify=20000):
+                  with_usn=True, with_meta=True, verify=20000, on_batch=None):
     """格式化恢复的完整版：**MFT 残留记录 + INDX 目录索引 + USN 变更日志**，三路合并。
 
     商业软件（ReclaiMe / R-Studio / DiskGenius / UFS Explorer）在格式化场景就是
@@ -2973,6 +3022,7 @@ def metadata_scan(letter, budget=None, limit=None, progress=None, cancel=None,
         scanned = 0
         meta_scanned = 0
         truncated = False
+        stream = _Streamer(on_batch)
 
         # USN 先跑：它只要几秒（实测 283MB 日志 5 秒），而且「名字」信息最难得。
         # 如果放在后面，整卷扫一旦吃满预算就轮不到它了 —— 这是第一次实现的顺序错误，
@@ -2998,7 +3048,18 @@ def metadata_scan(letter, budget=None, limit=None, progress=None, cancel=None,
                 buf = v.read(pos, min(block, end - pos))
                 if not buf:
                     break
+                n_rec = len(recs)
                 _scan_buffer(buf, pos, recs)
+                # 边扫边给界面看：这一批新认出的记录（还没合并、没核对内容）
+                for _off, _info in recs[n_rec:]:
+                    stream.add({
+                        "name": _info.get("name") or "",
+                        "size": _info.get("size") or 0,
+                        "mtime": _info.get("mtime") or "",
+                        "is_dir": bool(_info.get("is_dir")),
+                        "in_use": bool(_info.get("in_use")),
+                        "confidence": "pending",
+                    })
                 if with_index:
                     j = buf.find(b"INDX")
                     while j >= 0:
@@ -3020,6 +3081,7 @@ def metadata_scan(letter, budget=None, limit=None, progress=None, cancel=None,
             if truncated:
                 break
 
+        stream.flush()
         uniq = {}
         for off, info in recs:
             uniq.setdefault(off, info)

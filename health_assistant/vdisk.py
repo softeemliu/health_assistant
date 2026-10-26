@@ -15,16 +15,22 @@
   · VMDK monolithicSparse     （VMware）
   · dd 裸镜像 / 任意扁平字节流（原样透传）
 
-不支持的（识别出来就给明确指引，不假装是坏镜像）：
-  · E01 / Ex01（EWF 取证格式）、QCOW2、差分盘（VHD differencing）、压缩 VMDK
+  · E01（EWF 取证格式，EnCase 1~7 / FTK Imager / linen 都产出这种）
 
-全程只读。所有多字节字段：VHD 是**大端**，VHDX / VMDK 是**小端**。
+不支持的（识别出来就给明确指引，不假装是坏镜像）：
+  · Ex01 / L01（EWF 第二版、逻辑取证文件）、QCOW2、差分盘、压缩 VMDK
+
+全程只读。所有多字节字段：VHD 是**大端**，VHDX / VMDK / E01 是**小端**。
 """
 from __future__ import annotations
 
+import array
 import os
+import re
 import struct
+import sys
 import threading
+import zlib
 
 SECTOR = 512
 
@@ -33,11 +39,20 @@ SECTOR = 512
 _E01_HINT = (
     "这是一份 **E01 取证镜像**（EWF 格式，专业取证/实验室交付常用），"
     "不是普通的整盘镜像。\n\n"
-    "现在还不直接支持这种格式。可以这样转成裸镜像后再打开：\n"
-    "· 用 FTK Imager（免费）：「File → Create Disk Image」反过来不行，"
-    "要用「Export Disk Image」，或者先挂载 E01（FTK Imager 可以直接挂）再按盘读；\n"
-    "· 命令行工具 ewfexport（libewf）：`ewfexport -t out image.E01` 会得到 out.raw；\n"
+    "这个版本暂时读不了这个文件：**E01 第二版（.Ex01）** 是 EnCase 7 之后的新格式，"
+    "文件结构跟老 E01 不一样。\n\n"
+    "可以这样转成裸镜像后再打开：\n"
+    "· FTK Imager（免费）：打开这个 Ex01，用「Export Disk Image」导出 raw；\n"
+    "· 命令行 ewfexport（libewf）：`ewfexport -f raw -t out image.Ex01`；\n"
     "· 转出来的 .raw/.dd/.img 直接在这里打开就行。")
+
+_L01_HINT = (
+    "这是一个 **逻辑取证文件（.L01）**，不是磁盘镜像。\n\n"
+    "L01 里存的是取证时**挑出来的那些文件**（连同目录结构和元数据），"
+    "没有分区表、没有文件系统、也没有空闲空间 —— 所以按盘恢复的那套办法"
+    "（找删除记录、按内容扫描）在这里没有意义。\n\n"
+    "要看里面的文件，用 FTK Imager 或 EnCase 直接打开这个 L01 就行；"
+    "如果你要恢复的是那块盘上被删的东西，需要那块盘的 E01/raw 整盘镜像。")
 
 _QCOW_HINT = (
     "这是一份 **QCOW2 镜像**（QEMU/KVM 虚拟机的磁盘格式）。\n\n"
@@ -494,9 +509,391 @@ class _VmdkDisk(VDisk):
         self._h.close()
 
 
+# ───────────────────────── E01 / EWF（取证格式）─────────────────────────
+
+_EWF_SIG = b"EVF\x09\x0d\x0a\xff\x00"          # E01 / S01 的段文件头
+_EWF2_SIG = b"EVF2\r\n\x81\x00"                # Ex01（EWF 第二版）
+_EWF_L01_SIG = b"LVF\x09\x0d\x0a\xff\x00"      # L01 逻辑取证文件
+_EWF_EXT_RE = re.compile(r"^\.(?:e|ex|l|s)(?:[0-9]{2}|[a-z]{2})$", re.I)
+
+_SEC_DESC = 76          # section 描述符长度，所有 section 都一样
+_SEC_PAD = 72           # 校验和覆盖描述符前 72 字节（Adler-32）
+
+
+def _u32(b, off):
+    return struct.unpack_from("<I", b, off)[0] if len(b) >= off + 4 else 0
+
+
+def _u64(b, off):
+    return struct.unpack_from("<Q", b, off)[0] if len(b) >= off + 8 else 0
+
+
+def _adler(b):
+    return zlib.adler32(b) & 0xFFFFFFFF
+
+
+def _ewf_segments(path):
+    """找回同一套镜像的**所有分卷**（xxx.E01 / .E02 / …），按段号排序。
+
+    分卷是按大小切开的，少一段后面的数据就全错位 —— 所以这里不猜扩展名顺序，
+    而是把同目录下同样前缀、同样 EWF 签名的文件全找出来，按**文件头里记的段号**
+    （偏移 9，2 字节）排序。段号缺失时用扩展名顺序兜底。
+
+    段号从 1 开始；某一段的段号重复/为 0，就当它是「未知」，排在后面。
+    """
+    path = os.path.abspath(path)
+    folder, name = os.path.split(path)
+    stem, ext = os.path.splitext(name)
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        names = []
+    found = []
+    for fn in names:
+        s2, e2 = os.path.splitext(fn)
+        if s2.lower() != stem.lower() or not _EWF_EXT_RE.match(e2 or ""):
+            continue
+        found.append(os.path.join(folder, fn))
+    if path not in found:                    # 扩展名不规范的也照开
+        found.append(path)
+    segs = []
+    for p in found:
+        try:
+            with open(p, "rb") as fh:
+                head = fh.read(13)
+        except OSError:
+            continue
+        if not (head.startswith(_EWF_SIG) or head.startswith(_EWF_L01_SIG)
+                or head.startswith(_EWF2_SIG)):
+            continue
+        num = int.from_bytes(head[9:11], "little") if len(head) >= 11 else 0
+        segs.append((num or (1 << 20), p))
+    segs.sort()
+    return [p for _n, p in segs]
+
+
+def _ewf_sections(h, total):
+    """走一遍段文件里的 section 链 → [(类型, 描述符偏移, 段大小)]。
+
+    section 是**单向链表**：每个描述符里的「下一段偏移」指到下一个描述符。
+    到 "next"/"done" 就停（"next" 指向自己，如果不判会原地打转）。
+    """
+    out = []
+    off = 13                                  # 文件头 13 字节之后就全是 section
+    seen = set()
+    while 0 < off and off + _SEC_DESC <= total:
+        if off in seen:
+            break
+        seen.add(off)
+        desc = h.pread(off, _SEC_DESC)
+        if len(desc) < _SEC_DESC:
+            break
+        typ = desc[:16].split(b"\x00", 1)[0].decode("latin-1", "replace").strip()
+        nxt = _u64(desc, 16)
+        size = _u64(desc, 24)
+        out.append((typ, off, size))
+        if typ in ("next", "done") or nxt <= off or nxt >= total:
+            break
+        off = nxt
+    return out
+
+
+class _EwfDisk(VDisk):
+    """E01：把「分卷 + 一堆压缩块」还原成一块能按字节读的盘。
+
+    结构（依据 libewf 的 EWF 规范，字段偏移用真实样本核对过）：
+      · 段文件头 13 字节：签名 "EVF\\x09\\x0d\\x0a\\xff\\x00"(8) + 0x01(1) +
+        段号(2, 小端) + 0x0000(2)。
+      · 之后是 section 链表，每个 section 头 76 字节：
+        [0:16] 类型（"volume"/"sectors"/"table"/"next"/"done"…）、
+        [16:24] 下一段偏移、[24:32] 本段大小、[72:76] 描述符的 Adler-32。
+      · volume 段（1052 字节）：[4] 总块数、[8] 每块多少扇区（默认 64）、
+        [12] 每扇区多少字节（默认 512）、[16] 总扇区数（8 字节）。
+      · 数据都在 sectors 段里，一块一块紧挨着：要么是**一整段 zlib 流**
+        （自带 Adler-32），要么是**原始数据 + 4 字节 Adler-32**。
+      · 每块在哪由随后的 table 段给出：24 字节表头（[0] 条目数、[8] 基准偏移，
+        只有 EnCase 6+ 有这一栏）+ N 个 4 字节偏移。偏移最高位是「压没压」的标志，
+        所以真正的偏移要 `& 0x7FFFFFFF`。table2 是 table 的镜像，不用重复读。
+
+    读的时候不信任「最高位标志」也不信任「基准偏移」—— 这两个东西各家实现
+    有出入（EnCase 6.7.1 甚至会把 31 位用满）。做法是：拿到候选偏移后
+    **真的去解一次第一块**，解出来的字节数正好等于块大小才算数。解不开就换
+    另一种解释。这样「能不能读」永远有实证，不是猜。
+    """
+
+    kind = "e01"
+    label = "E01 取证镜像"
+
+    def __init__(self, path):
+        self._path = path
+        self._segs = []
+        self._tables = []          # [(起始块号, 块数, 段下标, 基准偏移, 偏移表, 结束位置)]
+        self._firsts = []          # 每张表的起始块号，给 bisect 用
+        self._chunk_n = 0          # 已收到的块数
+        self._chunk_size = 0
+        self._sectors = 0
+        self._bps = 0
+        self._chunk_n_want = 0     # volume 段里自称有多少块
+        self._bad = 0              # 有块解不出来（坏块）的次数
+        self._tl = threading.local()
+        self.note = ""
+        paths = _ewf_segments(path)
+        if not paths:
+            raise VDiskError("这不是 E01 镜像（文件头标记对不上）")
+        for p in paths:
+            self._segs.append(_Handles(p))
+        try:
+            self._load()
+        except Exception:
+            self.close()
+            raise
+        if not self._chunk_size or not self.size:
+            self.close()
+            raise VDiskError("这份 E01 读不出「块大小 / 盘有多大」，"
+                             "文件可能被截断或者根本不是 E01")
+
+    # ── 打开时的解析 ──────────────────────────────────────────────
+
+    def _load(self):
+        vol = None
+        plan = []                              # [(段下标, table 段偏移, 前一个 sectors 偏移)]
+        for si, h in enumerate(self._segs):
+            try:
+                total = os.path.getsize(h.path)
+            except OSError:
+                continue
+            prev_sect = 0
+            for typ, off, _size in _ewf_sections(h, total):
+                if typ in ("volume", "disk"):
+                    if vol is None:
+                        vol = h.pread(off + _SEC_DESC, 1052)
+                elif typ == "sectors":
+                    prev_sect = off
+                elif typ == "table" and prev_sect:
+                    plan.append((si, off, prev_sect))
+        if vol:
+            self._read_volume(vol)
+        if not self._chunk_size:
+            self._guess_chunk_size(plan)
+        for si, off, sect in plan:
+            self._add_table(si, off, sect)
+        if not self._chunk_n:
+            raise VDiskError("这份 E01 里一块数据都没找到 —— 文件可能被截断，"
+                             "也可能分卷不齐（只给了一部分 .E01/.E02…），或者块表坏了")
+        want = self._sectors * self._bps if (self._sectors and self._bps) else 0
+        total = self._chunk_n * self._chunk_size
+        self.size = min(want, total) if want else total
+        miss = self._chunk_n_want - self._chunk_n
+        if miss > 0:
+            self.note = (f"块表里只有 {self._chunk_n} 块，镜像自称 {self._chunk_n_want} 块"
+                         f"（少 {miss} 块，分卷可能不齐），缺的部分按 0 读")
+        elif want and total < want:
+            self.note = (f"数据比镜像自称的少 {want - total} 字节，缺的部分按 0 读")
+        elif len(self._segs) > 1:
+            # 分卷个数写进 label（界面那行「已解开：…」直接用它），note 留给出问题的情况
+            self.label = f"E01 取证镜像（{len(self._segs)} 个分卷）"
+
+    def _read_volume(self, raw):
+        if len(raw) < 20:
+            return
+        n = _u32(raw, 4)
+        spc = _u32(raw, 8)
+        bps = _u32(raw, 12)
+        secs = _u64(raw, 16)
+        # 三个值必须自洽：块 = 每块扇区数 × 每扇区字节数，且都是 2 的幂/整数倍
+        if (0 < spc <= 1 << 20 and 128 <= bps <= 1 << 16
+                and (bps & (bps - 1)) == 0 and SECTOR <= spc * bps <= 64 << 20):
+            self._chunk_size = spc * bps
+            self._bps = bps
+        if 0 < secs < (1 << 48):
+            self._sectors = secs
+        if 0 < n < (1 << 32):
+            self._chunk_n_want = n
+        else:
+            self._chunk_n_want = 0
+
+    def _guess_chunk_size(self, plan):
+        """volume 段读不出来时，直接从第一块解出来的长度反推块大小。"""
+        for si, off, sect in plan:
+            h = self._segs[si]
+            hdr = h.pread(off + _SEC_DESC, 24)
+            n = _u32(hdr, 0)
+            if not 0 < n < (1 << 23):
+                continue
+            entries = h.pread(off + _SEC_DESC + 24, min(n, 2) * 4)
+            if len(entries) < 8:
+                continue
+            a = _u32(entries, 0) & 0x7FFFFFFF
+            b = _u32(entries, 4) & 0x7FFFFFFF
+            for base in (_u64(hdr, 8), 0):
+                if b <= a or not (sect < base + a < off):
+                    continue
+                raw = h.pread(base + a, b - a)
+                try:
+                    d = zlib.decompressobj().decompress(raw, 64 << 20)
+                except zlib.error:
+                    continue
+                if d:
+                    self._chunk_size = len(d)
+                    self._bps = SECTOR
+                    return
+
+    def _add_table(self, si, table_off, sect_off):
+        """读一张块表，把「块偏移」按哪种解释读得通这件事**当场验证**掉。"""
+        h = self._segs[si]
+        hdr = h.pread(table_off + _SEC_DESC, 24)
+        n = _u32(hdr, 0)
+        if not 0 < n < (1 << 23):
+            return
+        base_off = _u64(hdr, 8)                # EnCase 6+ 才有这一栏，老版本是 0
+        raw = h.pread(table_off + _SEC_DESC + 24, n * 4)
+        n = min(n, len(raw) // 4)
+        if n <= 0:
+            return
+        arr = array.array("I")
+        arr.frombytes(raw[:n * 4])
+        if sys.byteorder != "little":
+            arr.byteswap()
+        vals = [v & 0x7FFFFFFF for v in arr]    # 最高位是「压没压」的标志，不是偏移
+        end = table_off                        # 块都在 table 之前，到这儿为止
+        chosen = None
+        for base in ([base_off, 0] if base_off else [0]):
+            if self._verify(h, vals, base, end, sect_off):
+                chosen = (base, vals)
+                break
+        if chosen is None and any(v & 0x80000000 for v in arr):
+            # 极少数（EnCase 6.7.1 的 bug）会把 31 位用满，那时不能剥最高位
+            raw_vals = list(arr)
+            for base in ([base_off, 0] if base_off else [0]):
+                if self._verify(h, raw_vals, base, end, sect_off):
+                    chosen = (base, raw_vals)
+                    break
+        base, vals = chosen if chosen else (base_off, vals)   # 都不通也先收下
+        self._firsts.append(self._chunk_n)
+        self._tables.append((self._chunk_n, n, si, base, vals, end))
+        self._chunk_n += n
+
+    def _verify(self, h, vals, base, end, sect_off):
+        """按这种解释读第一块：能解出东西才算解释对。
+
+        不强求「正好一整块」—— 只有一个残块的镜像（盘比块小）第一块本来就是
+        短的。判据是「zlib 解得开」或者「Adler-32 对得上」，这两个撞对的概率
+        可以忽略，所以这是实证而不是猜。
+        """
+        a = base + vals[0]
+        b = base + (vals[1] if len(vals) > 1 else 0)
+        if len(vals) == 1:
+            b = end
+        if b <= a or not (sect_off < a < end):
+            return False
+        data, ok = self._load_chunk(h, a, b - a)
+        return bool(ok and data)
+
+    # ── 按块取数据 ────────────────────────────────────────────────
+
+    def _decode(self, raw, limit):
+        """一块的原始字节 → (数据, 是否可信)。
+
+        先按 zlib 解；解不出来再按「原始数据 + 4 字节 Adler-32」验一遍。
+        两条都不成立就是坏块 —— **不返回猜的内容**（宁可如实算 0）。
+        """
+        if len(raw) < 8:
+            return None, False
+        try:
+            d = zlib.decompressobj().decompress(raw, limit + 1)
+        except zlib.error:
+            d = b""
+        if 0 < len(d) <= limit:
+            return d, True
+        for blen in (limit, len(raw) - 4):
+            if 8 < blen <= len(raw) - 4 and _adler(raw[:blen]) == _u32(raw, blen):
+                return raw[:blen], True
+        return None, False
+
+    def _load_chunk(self, h, off, length):
+        if length <= 0:
+            return None, False
+        limit = self._chunk_size or (1 << 23)
+        # 压缩块比原始略大是正常的（压不动的数据），留足余量但不给无限空间
+        if length > limit * 2 + (1 << 16):
+            return None, False
+        return self._decode(h.pread(off, length), limit)
+
+    def _load_index(self, idx):
+        i = _bsearch(self._firsts, idx)
+        if i < 0:
+            return None
+        first, n, si, base, vals, end = self._tables[i]
+        j = idx - first
+        a = base + vals[j]
+        b = base + vals[j + 1] if j + 1 < n else end
+        data, ok = self._load_chunk(self._segs[si], a, b - a)
+        if not ok:
+            self._bad += 1
+        return data
+
+    def _chunk_at(self, idx):
+        """每线程一个小缓存：扫描是「顺序读 + 少量回头」，块比页大得多。"""
+        local = self._tl
+        cache = getattr(local, "cache", None)
+        if cache is None:
+            cache = local.cache = {}
+        data = cache.get(idx)
+        if data is None and idx not in cache:
+            data = self._load_index(idx)
+            if len(cache) >= 8:
+                cache.pop(next(iter(cache)))
+            cache[idx] = data
+        return data
+
+    # ── 对外 ──────────────────────────────────────────────────────
+
+    def read(self, off, n):
+        if off < 0 or off >= self.size or n <= 0:
+            return b""
+        n = min(n, self.size - off)
+        cs = self._chunk_size
+        out = bytearray()
+        pos = off
+        left = n
+        while left > 0:
+            idx = pos // cs
+            inner = pos % cs
+            take = min(left, cs - inner)
+            data = self._chunk_at(idx)
+            if data and len(data) >= inner + take:
+                out += data[inner:inner + take]
+            elif data:
+                piece = data[inner:inner + take]
+                out += piece + bytes(take - len(piece))
+            else:                              # 坏块 / 缺块：按 0 读，不编内容
+                out += bytes(take)
+            pos += take
+            left -= take
+        return bytes(out)
+
+    def close(self):
+        for h in self._segs:
+            h.close()
+        self._segs = []
+        self._tables = []
+        self._tl = threading.local()
+
+
+def _bsearch(firsts, idx):
+    """在「每张表的起始块号」里找 idx 落在哪张表（表是按块号递增排的）。"""
+    lo, hi = 0, len(firsts)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if firsts[mid] <= idx:
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo - 1 if lo > 0 else -1
+
+
 # ───────────────────────── 识别 + 打开 ─────────────────────────
 
-_E01_SIGS = (b"EVF\x09\x0d\x0a\xff\x00", b"EVF2\r\n\x81\x00")
 _QCOW_SIG = b"QFI\xfb"
 
 
@@ -504,7 +901,7 @@ def probe(path):
     """看一眼这是什么格式，返回 (kind, label)。不打开、不解析。
 
     kind 为 `raw` 表示「就是一段扁平字节流」（dd 镜像、任意数据）。
-    已知但**不支持**的格式也会如实返回（e01 / qcow2 / vhd-differencing），
+    已知但**不支持**的格式也会如实返回（ex01 / l01 / qcow2 / vhd-differencing），
     这样调用方能给出「为什么读不了、怎么转」而不是「这不是文件系统」。
     """
     try:
@@ -524,9 +921,12 @@ def probe(path):
         return "vmdk", "VMDK 虚拟盘"
     if head[:4] == b"# Di":
         return "vmdk-descriptor", "VMDK 描述文件"
-    for sig in _E01_SIGS:
-        if head.startswith(sig):
-            return "e01", "E01 取证镜像"
+    if head.startswith(_EWF_SIG):
+        return "e01", "E01 取证镜像"
+    if head.startswith(_EWF_L01_SIG):
+        return "l01", "L01 逻辑取证文件"
+    if head.startswith(_EWF2_SIG):
+        return "ex01", "E01 第二版（Ex01）"
     if head[:4] == _QCOW_SIG:
         return "qcow2", "QCOW2 镜像"
     if tail[:8] == _VHD_COOKIE:
@@ -557,7 +957,11 @@ def open_path(path):
     if kind == "vmdk-descriptor":
         raise VDiskError(_VMDK_DESCRIPTOR_HINT)
     if kind == "e01":
+        return _EwfDisk(path)
+    if kind == "ex01":
         raise VDiskError(_E01_HINT)
+    if kind == "l01":
+        raise VDiskError(_L01_HINT)
     if kind == "qcow2":
         raise VDiskError(_QCOW_HINT)
     if kind == "vhd-diff":

@@ -311,6 +311,39 @@ class CheckTable(DataTable):
             return self._rows[i]
         return None
 
+    def append_check_rows(self, rows, payloads, checked=False):
+        """往末尾追加行，不重建整张表（边扫边出结果时用）。
+
+        重建一次十几万行要好几秒；追加一批只跟这一批的条数有关。
+        首列 UserRole 里存的是**在 `self._rows` 里的下标**，所以必须先算出
+        追加前的长度当基准，否则勾选会勾到别人身上。
+        """
+        if not rows:
+            return
+        base = len(self._rows)
+        self._rows.extend(payloads)
+        r0 = self.rowCount()
+        self.blockSignals(True)
+        self.setUpdatesEnabled(False)
+        self.setRowCount(r0 + len(rows))
+        for k, row in enumerate(rows):
+            r = r0 + k
+            chk = QTableWidgetItem("")
+            chk.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            chk.setCheckState(Qt.Checked if checked else Qt.Unchecked)
+            chk.setData(Qt.UserRole, base + k)
+            self.setItem(r, 0, chk)
+            for c, spec in enumerate(row, start=1):
+                align = self._align_of(c)
+                if isinstance(spec, (tuple, list)) and len(spec) == 2:
+                    cell = _Cell(spec[0], sortv=spec[1], align=align)
+                else:
+                    cell = _Cell("" if spec is None else spec, align=align)
+                self.setItem(r, c, cell)
+        self.setUpdatesEnabled(True)
+        self.blockSignals(False)
+        self._emit_counts()
+
     def set_row_checked(self, row, on=True):
         it = self.item(row, 0)
         if it is not None:
