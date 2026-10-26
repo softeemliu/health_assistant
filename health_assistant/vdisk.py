@@ -210,6 +210,10 @@ class _VhdDisk(VDisk):
             raise VDiskError("这个文件的结尾没有 VHD 标记（不是一个完整的 VHD）")
         self._dtype = _be(foot, 0x3C, 4)
         self._dyn_off = _be(foot, 0x10, 8)
+        # footer 里的 current_size 就是「这块虚拟盘有多大」。它可能比创建时要求的
+        # 略大：VHD 用 CHS 几何描述容量，容量必须是 C×H×S 的整数倍
+        # （qemu-img convert -O vpc 把 2MB 写成 61×4×17 = 2123776 字节，多出
+        #  26KB 全零尾巴）。这是格式允许的，不是读错 —— 别拿它当 bug 再查一遍。
         cur = _be(foot, 0x30, 8)
         self._cur_size = cur or _be(foot, 0x28, 8)
         self.size = self._cur_size
@@ -425,7 +429,14 @@ class _VmdkDisk(VDisk):
       0x2C numGTEsPerGT     —— 每张 grain 表多少项
       0x38 gdOffset         —— grain 目录（GD）在文件里的扇区号
       0x40 overhead         —— 数据区起始扇区
-      0x4C compressAlgorithm—— 0 表示不压缩（非 0 就是压缩流，读不了）
+      0x4D compressAlgorithm —— 0 不压缩 / 1 deflate
+
+    最后一个字段的位置是 **0x4D，不是 0x4C**：magic 之后的 75 字节是 packed
+    结构体，末尾是 filler[1] + check_bytes[4]（固定 0x0A 0x20 0x0D 0x0A），
+    compressAlgorithm 紧接其后（0x4D，小端 2 字节）。
+    早先按 0x4C 读，读到的正是 check_bytes[3]=0x0A，于是**每一个 VMDK 都被判成
+    「压缩过的」直接拒开** —— 自造样本因为读写两边都写 0x4C 而自洽，直到拿
+    qemu-img 真造一份才暴露（`_test_qemu_cross.py` 抓出来的）。
 
     GD 每项 4 字节 = 对应 grain 表的扇区号；grain 表每项 4 字节 = 该 grain
     在文件里的扇区号，0 表示「没分配，读出来全 0」。
@@ -447,7 +458,7 @@ class _VmdkDisk(VDisk):
         self._grain_sectors = struct.unpack_from("<Q", head, 0x14)[0]
         self._gtes = struct.unpack_from("<I", head, 0x2C)[0]
         self._gd = struct.unpack_from("<Q", head, 0x38)[0]
-        self._compress = struct.unpack_from("<H", head, 0x4C)[0]
+        self._compress = struct.unpack_from("<H", head, 0x4D)[0]
         self.size = self._capacity * SECTOR
         if self._compress:
             raise VDiskError(_VMDK_COMPRESSED_HINT)
