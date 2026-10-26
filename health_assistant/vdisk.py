@@ -1,10 +1,10 @@
-"""虚拟磁盘读取：把 VHD / VHDX / VMDK 当成一块「扁平的、能按字节读」的盘。
+"""虚拟磁盘读取：把 VHD / VHDX / VMDK / QCOW2 当成一块「扁平的、能按字节读」的盘。
 
 为什么要这一层：用户手上的镜像很少是 `dd` 出来的裸数据。Windows 自己的
 「磁盘管理 / Hyper-V / 系统映像备份」产出的是 VHD / VHDX，VMware 的是 VMDK，
-专业取证交付的是 E01。这些格式内部都是「稀疏块 + 映射表」，直接按文件偏移读
-读到的是映射表，不是一个盘 —— 于是工具会告诉你「引导扇区认不出来」，
-而真正的原因是「这根本不是裸镜像」。
+QEMU / KVM / Proxmox / 云厂商的是 QCOW2，专业取证交付的是 E01。这些格式内部都是
+「稀疏块 + 映射表」，直接按文件偏移读读到的是映射表，不是一个盘 —— 于是工具会
+告诉你「引导扇区认不出来」，而真正的原因是「这根本不是裸镜像」。
 
 这一层只做一件事：**认得出来 + 解得开**，让它和裸镜像走完全相同的后续流程
 （分区表、NTFS/FAT 解析、按类型找、恢复导出都不用改）。
@@ -13,16 +13,19 @@
   · VHD  fixed / dynamic      （微软 Virtual PC / diskpart `create vdisk`）
   · VHDX fixed / dynamic      （Hyper-V、Windows 系统映像备份）
   · VMDK monolithicSparse     （VMware）
+  · QCOW2 v2 / v3             （QEMU / KVM / Proxmox；含压缩簇、零簇、差分链）
   · dd 裸镜像 / 任意扁平字节流（原样透传）
 
   · E01（EWF 第一版，EnCase 1~6 / FTK Imager / linen 都产出这种）
   · Ex01（EWF 第二版，EnCase 7 之后）
 
 不支持的（识别出来就给明确指引，不假装是坏镜像）：
-  · L01 / Lx01（逻辑取证文件，里面是挑出来的文件、不是盘）、QCOW2、
-    差分盘（VHD differencing）、加密的 Ex01
+  · L01 / Lx01（逻辑取证文件，里面是挑出来的文件、不是盘）
+  · 加密的 QCOW2 / Ex01、QCOW2 的 external data file 与 extended L2、
+    差分盘（VHD differencing）
 
-全程只读。所有多字节字段：VHD 是**大端**，VHDX / VMDK / E01 / Ex01 是**小端**。
+全程只读。所有多字节字段：VHD 是**大端**，QCOW2 是**大端**，
+VHDX / VMDK / E01 / Ex01 是**小端**。
 """
 from __future__ import annotations
 
@@ -35,6 +38,13 @@ import sys
 import threading
 import zlib
 
+# zstd 压缩的 QCOW2 簇只有极少数镜像会用；没装这个库就如实说读不了，
+# 不学「拿错数据凑数」。放在顶层 try 里是为了打包时能被静态分析看到。
+try:
+    import zstandard as _zstd
+except Exception:                        # noqa: BLE001  没装 / 装了但加载不了
+    _zstd = None
+
 SECTOR = 512
 
 # ───────────────────────── 用户能看懂的错误 ─────────────────────────
@@ -46,11 +56,6 @@ _L01_HINT = (
     "（找删除记录、按内容扫描）在这里没有意义。\n\n"
     "要看里面的文件，用 FTK Imager 或 EnCase 直接打开这个 L01 就行；"
     "如果你要恢复的是那块盘上被删的东西，需要那块盘的 E01/raw 整盘镜像。")
-
-_QCOW_HINT = (
-    "这是一份 **QCOW2 镜像**（QEMU/KVM 虚拟机的磁盘格式）。\n\n"
-    "现在还不直接支持。可以先用 `qemu-img convert -f qcow2 -O raw 镜像.qcow2 盘.raw` "
-    "转成裸镜像，再在这里打开。")
 
 _VHD_DIFF_HINT = (
     "这是一个 **差分 VHD**（differencing）—— 它只存了「相对父盘改动过的块」，"
@@ -500,6 +505,278 @@ class _VmdkDisk(VDisk):
 
     def close(self):
         self._h.close()
+
+
+# ───────────────────────── QCOW2（QEMU / KVM）─────────────────────────
+
+_QCOW_SIG = b"QFI\xfb"
+
+_QCOW_OFLAG_ZERO = 1 << 0
+_QCOW_OFLAG_COMPRESSED = 1 << 62
+_QCOW_OFFSET_MASK = 0x00FFFFFFFFFFFE00      # host 偏移占 bit 9~55
+
+# incompatible_features（v3）：未知位不许猜，必须拒绝 —— 猜了就是错位的数据
+_QCOW_IN_EXTERNAL_DATA = 1 << 2
+_QCOW_IN_COMPRESSION_TYPE = 1 << 3
+_QCOW_IN_EXTENDED_L2 = 1 << 4
+_QCOW_IN_KNOWN = 0x1F
+
+
+def _u32be(b, off):
+    return struct.unpack_from(">I", b, off)[0] if len(b) >= off + 4 else 0
+
+
+def _u64be(b, off):
+    return struct.unpack_from(">Q", b, off)[0] if len(b) >= off + 8 else 0
+
+
+_QCOW_CRYPT_HINT = (
+    "这是一份**加了密的 QCOW2 镜像**（AES 或 LUKS 加密）。\n\n"
+    "没有口令读不出里面的数据，本工具也不猜口令、不尝试破解。\n\n"
+    "要读它得先解密：用 `qemu-img convert` 配合 `--object secret` 把口令交给 qemu，"
+    "转成裸镜像（.raw）再在这里打开。")
+
+_QCOW_BACKING_HINT = (
+    "这是一份 **QCOW2 差分盘**（快照的增量层）—— 它只存了「相对底层改动过的块」，"
+    "单独一份不构成完整的盘。\n\n"
+    "它要读的底层盘是：\n    {name}\n\n"
+    "把这个文件按上面的路径放好（通常是同一目录）再打开，本工具会把两层叠起来读；"
+    "也可以用 `qemu-img convert -O raw` 把整条链合并成一份裸镜像。")
+
+_QCOW_EXTERNAL_DATA_HINT = (
+    "这是一份**数据放在外部文件里的 QCOW2**（external data file）——"
+    "元数据在这个文件里，真正的扇区数据在同目录的另一个 .raw 文件里。\n\n"
+    "目前不直接支持这种拆开放法。用 `qemu-img convert -O raw` 合并成一份裸镜像再打开。")
+
+_QCOW_EXTENDED_L2_HINT = (
+    "这份 QCOW2 用了 **extended L2（子簇分配）**，是比较新的写法，"
+    "目前还不支持。\n\n"
+    "用 `qemu-img convert -O raw` 转成裸镜像再打开。")
+
+_QCOW_ZSTD_HINT = (
+    "这份 QCOW2 的压缩簇用的是 **zstd**，本机没装解压它的库，"
+    "所以现在读不出来（不会拿错数据凑数）。\n\n"
+    "用 `qemu-img convert -O raw` 转成裸镜像再打开，或者装上 `zstandard` 后重开本工具。")
+
+
+class _Qcow2Disk(VDisk):
+    """QCOW2：QEMU / KVM / Proxmox / 云厂商导出的默认磁盘格式。
+
+    头部 72 字节（v3 起 104+），**所有字段大端**，偏移：
+      4  version          20 cluster_bits     36 l1_size
+      8  backing 名字偏移  24 虚拟盘字节数     40 l1 表偏移
+      16 backing 名字长度  32 crypt_method     72 incompatible_features（v3）
+                                              104 compression_type（v3，0 deflate / 1 zstd）
+
+    L1 表：l1_size 个 8 字节项 → 每项指向一张 L2 表所在的簇（偏移在 bit 9~55），
+    为 0 表示这张 L2 整个没分配。
+    L2 表：每项 8 字节描述一个 guest 簇：
+      bit 62   压缩簇（内容是一段**裸 deflate 流**，没有 zlib 头）
+      bit 0    读出来全是 0（不再往下找底层盘）
+      bit 9~55 数据在文件里的偏移；为 0 = 没分配 → 读底层盘（没有就全 0）
+
+    压缩簇把「偏移」和「长度」挤在最低的 x = 62-(cluster_bits-8) 位里：
+      偏移 = 低 x 位，**不是簇或扇区对齐的**；
+      长度 = 再往上 (62-x) 位加 1，按 512 字节扇区算，再减去偏移落在扇区内的那截。
+    这两个式子照 qcow2 规范写；错了就解不开（实测拿 qemu 产出的镜像验过）。
+    """
+
+    kind = "qcow2"
+
+    def __init__(self, path, _seen=None):
+        path = os.path.abspath(path)
+        self._path = path
+        self._h = _Handles(path)
+        self._l2_cache = {}
+        self._backing = None
+        self.bad_clusters = 0
+        self._comp = 0
+        head = self._h.pread(0, 512)
+        if head[:4] != _QCOW_SIG:
+            raise VDiskError("这不是 QCOW2（文件头标记对不上）")
+        if len(head) < 72:
+            raise VDiskError("这份 QCOW2 文件太小，连头部都不完整（可能没拷完）。")
+        self._version = _u32be(head, 4)
+        if self._version not in (2, 3):
+            raise VDiskError(f"这份 QCOW2 的版本号是 {self._version}，只认得 2 和 3。")
+        cb = _u32be(head, 20)
+        if cb < 9 or cb > 21:
+            raise VDiskError("这份 QCOW2 的头部坏了（簇大小字段不合理）。")
+        self._cluster_bits = cb
+        self._cluster = 1 << cb
+        self.size = _u64be(head, 24)
+        if _u32be(head, 32):
+            raise VDiskError(_QCOW_CRYPT_HINT)
+        l1_size = _u32be(head, 36)
+        l1_off = _u64be(head, 40)
+        if not l1_size or not l1_off or l1_size > (1 << 22):
+            raise VDiskError("这份 QCOW2 的头部坏了（L1 表字段不合理）。")
+        if self._version >= 3:
+            feats = _u64be(head, 72)
+            if feats & _QCOW_IN_EXTERNAL_DATA:
+                raise VDiskError(_QCOW_EXTERNAL_DATA_HINT)
+            if feats & _QCOW_IN_EXTENDED_L2:
+                raise VDiskError(_QCOW_EXTENDED_L2_HINT)
+            if feats & ~_QCOW_IN_KNOWN:
+                raise VDiskError("这份 QCOW2 用了本工具不认识的新特性，为了不给错数据，"
+                                 "先不打开。用 `qemu-img convert -O raw` 转成裸镜像再试。")
+            if feats & _QCOW_IN_COMPRESSION_TYPE:
+                self._comp = head[104] if len(head) > 104 else 0
+                if self._comp == 1:
+                    if _zstd is None:
+                        raise VDiskError(_QCOW_ZSTD_HINT)
+                elif self._comp != 0:
+                    raise VDiskError(f"这份 QCOW2 的压缩方式是 {self._comp}，"
+                                     f"本工具只认得 deflate 和 zstd。")
+        raw = self._h.pread(l1_off, l1_size * 8)
+        if len(raw) != l1_size * 8:
+            raise VDiskError("这份 QCOW2 的 L1 表读不全（文件可能被截断了）。")
+        self._l1 = struct.unpack(">%dQ" % l1_size, raw)
+        self._l2_count = self._cluster // 8
+        self._l2_bytes = self._cluster
+        self._l2_shift = cb - 3                 # 一个 L2 表管 2^(cb-3) 个 guest 簇
+        self.label = "QCOW2 镜像"
+        seen = set(_seen or ())
+        seen.add(path)
+        self._open_backing(head, seen)
+
+    def _open_backing(self, head, seen):
+        off = _u64be(head, 8)
+        size = _u32be(head, 16)
+        if not off or not size or size > 1023:
+            return
+        raw = self._h.pread(off, size)
+        name = raw.decode("utf-8", "replace").strip("\x00").strip()
+        if not name:
+            return
+        if not os.path.isabs(name):
+            name = os.path.join(os.path.dirname(self._path), name)
+        name = os.path.abspath(name)
+        if not os.path.isfile(name):
+            raise VDiskError(_QCOW_BACKING_HINT.format(name=name))
+        if name in seen:
+            raise VDiskError("这份 QCOW2 的差分链指向了自己（底层盘绕成环），没法读。")
+        seen.add(name)
+        parent = open_path(name, seen)          # 底层盘也可能是 raw / vmdk / 另一份 qcow2
+        self._backing = parent
+        self.label = "QCOW2 镜像（含差分层）"
+        self.note = (f"这是一份差分盘，已经把底层「{os.path.basename(name)}」"
+                     f"叠上来一起读（看到的是合并后的样子）；单独交出去的这一份不完整。")
+
+    def _l2_entry(self, cid):
+        idx = cid >> self._l2_shift
+        if idx >= len(self._l1):
+            return 0
+        tab = self._l2_cache.get(idx)
+        if tab is None:
+            base = self._l1[idx] & _QCOW_OFFSET_MASK
+            if not base:
+                return 0
+            raw = self._h.pread(base, self._l2_bytes)
+            if len(raw) != self._l2_bytes:
+                return 0
+            tab = struct.unpack(">%dQ" % self._l2_count, raw)
+            if len(self._l2_cache) > 4096:
+                self._l2_cache.clear()
+            self._l2_cache[idx] = tab
+        return tab[cid & (self._l2_count - 1)]
+
+    def _decompress(self, entry):
+        x = 62 - (self._cluster_bits - 8)
+        coff = entry & ((1 << x) - 1)
+        nb = ((entry >> x) & ((1 << (62 - x)) - 1)) + 1
+        want = nb * SECTOR - (coff % SECTOR)
+        if coff <= 0 or want <= 0:
+            self.bad_clusters += 1
+            return b""
+        raw = self._h.pread(coff, want)
+        if not raw:
+            self.bad_clusters += 1
+            return b""
+        try:
+            if self._comp == 1:
+                out = _zstd.ZstdDecompressor().decompress(
+                    raw, max_output_size=self._cluster)
+            else:
+                d = zlib.decompressobj(-15)     # 裸 deflate：qemu 不写 zlib 头
+                out = b""
+                buf = raw
+                while buf and len(out) < self._cluster:
+                    out += d.decompress(buf, self._cluster - len(out))
+                    buf = d.unconsumed_tail
+                    if d.eof:
+                        break
+        except Exception:
+            self.bad_clusters += 1
+            return b""
+        if len(out) < self._cluster:
+            self.bad_clusters += 1               # 解出来不够一簇 = 这段是坏的
+        return out
+
+    def _part(self, cid, inner, take):
+        entry = self._l2_entry(cid)
+        if entry & _QCOW_OFLAG_COMPRESSED:
+            data = self._decompress(entry)
+            if not data:
+                return bytes(take)
+            return data[inner:inner + take].ljust(take, b"\x00")
+        if entry & _QCOW_OFLAG_ZERO:
+            return bytes(take)
+        host = entry & _QCOW_OFFSET_MASK
+        if host:
+            chunk = self._h.pread(host + inner, take)
+            return chunk if len(chunk) == take else chunk + bytes(take - len(chunk))
+        return self._from_backing(cid * self._cluster + inner, take)
+
+    def _from_backing(self, off, n):
+        b = self._backing
+        if b is None or off >= b.size:
+            return bytes(n)
+        take = min(n, b.size - off)
+        data = b.read(off, take)
+        return data.ljust(n, b"\x00")
+
+    def read(self, off, n):
+        if off < 0 or off >= self.size:
+            return b""
+        n = min(n, self.size - off)
+        csize = self._cluster
+        out = bytearray()
+        pos, left = off, n
+        while left > 0:
+            inner = pos & (csize - 1)
+            take = min(left, csize - inner)
+            out += self._part(pos >> self._cluster_bits, inner, take)
+            pos += take
+            left -= take
+        return bytes(out)
+
+    def close(self):
+        if self._backing is not None:
+            self._backing.close()
+        self._h.close()
+
+
+def _qcow2_backing(path):
+    """只看头部，返回这份 QCOW2 的底层盘路径（没有 / 读不了 → None）。"""
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(64)
+            if head[:4] != _QCOW_SIG:
+                return None
+            off = _u64be(head, 8)
+            size = _u32be(head, 16)
+            if not off or not size or size > 1023:
+                return None
+            fh.seek(off)
+            name = fh.read(size).decode("utf-8", "replace").strip("\x00").strip()
+    except OSError:
+        return None
+    if not name:
+        return None
+    if not os.path.isabs(name):
+        name = os.path.join(os.path.dirname(os.path.abspath(path)), name)
+    return os.path.abspath(name)
 
 
 # ───────────────────────── E01 / EWF（取证格式）─────────────────────────
@@ -1373,14 +1650,12 @@ def _as_int(text):
 
 # ───────────────────────── 识别 + 打开 ─────────────────────────
 
-_QCOW_SIG = b"QFI\xfb"
-
 
 def probe(path):
     """看一眼这是什么格式，返回 (kind, label)。不打开、不解析。
 
     kind 为 `raw` 表示「就是一段扁平字节流」（dd 镜像、任意数据）。
-    已知但**不支持**的格式也会如实返回（lx01 / l01 / qcow2 / vhd-differencing），
+    已知但**不支持**的格式也会如实返回（lx01 / l01 / qcow2-crypt / vhd-differencing），
     这样调用方能给出「为什么读不了、怎么转」而不是「这不是文件系统」。
     """
     try:
@@ -1409,6 +1684,8 @@ def probe(path):
     if head.startswith(_EX01_LX_SIG):
         return "lx01", "Lx01 逻辑取证文件"
     if head[:4] == _QCOW_SIG:
+        if _u32be(head, 32):
+            return "qcow2-crypt", "QCOW2 镜像（加密）"
         return "qcow2", "QCOW2 镜像"
     if tail[:8] == _VHD_COOKIE:
         dtype = _be(tail, 0x3C, 4)
@@ -1426,7 +1703,8 @@ def source_size(path):
     """这份镜像在磁盘上占多少字节。
 
     E01 是多分卷，只看用户点的那一段会少算（实测 8 段各 2MB，界面显示「0 MB」）。
-    这里把同一套的段全加起来；其它格式就是文件本身的大小。
+    QCOW2 差分盘同理：只算最上面一层会少算底层的量。这里把这套文件全加起来；
+    其它格式就是文件本身的大小。
     """
     try:
         kind, _label = probe(path)
@@ -1440,16 +1718,30 @@ def source_size(path):
                     pass
             if total:
                 return total
+        if kind in ("qcow2", "qcow2-crypt"):
+            total = 0
+            seen = set()
+            cur = os.path.abspath(path)
+            while cur and cur not in seen:
+                seen.add(cur)
+                try:
+                    total += os.path.getsize(cur)
+                except OSError:
+                    break
+                cur = _qcow2_backing(cur)
+            if total:
+                return total
         return os.path.getsize(path)
     except OSError:
         return 0
 
 
-def open_path(path):
+def open_path(path, _seen=None):
     """打开一份镜像，返回能按字节读的盘对象。
 
     普通镜像（dd / 裸数据）也会返回对象 —— 调用方不用区分「虚拟盘」和「文件」。
     已知但不支持的格式抛 `VDiskError`，消息里带转换办法。
+    `_seen` 是内部用的：QCOW2 差分链要防环，别在调用方传。
     """
     kind, _label = probe(path)
     if kind == "missing":
@@ -1469,7 +1761,9 @@ def open_path(path):
     if kind == "l01":
         raise VDiskError(_L01_HINT)
     if kind == "qcow2":
-        raise VDiskError(_QCOW_HINT)
+        return _Qcow2Disk(path, _seen)
+    if kind == "qcow2-crypt":
+        raise VDiskError(_QCOW_CRYPT_HINT)
     if kind == "vhd-diff":
         raise VDiskError(_VHD_DIFF_HINT)
     if kind in ("vhd-fixed", "vhd-dynamic"):

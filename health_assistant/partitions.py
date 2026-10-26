@@ -212,7 +212,7 @@ def list_partitions(path):
     返回 `{"scheme", "parts": [...], "note"}`。每个分区带 `fs`（探测到的文件系统）。
     支持 MBR、GPT，以及「两者都没有但 0 偏移直接是 NTFS」的单分区镜像。
 
-    镜像可能是虚拟盘（VHD / VHDX / VMDK），统一交给 `vdisk` 解成扁平字节流 ——
+    镜像可能是虚拟盘（VHD / VHDX / VMDK / QCOW2），统一交给 `vdisk` 解成扁平字节流 ——
     否则读到的是映射表而不是分区表。
     """
     from . import vdisk

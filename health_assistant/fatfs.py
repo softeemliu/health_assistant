@@ -596,7 +596,7 @@ def image_kind(path, base=0):
     """镜像里 `base` 处的卷首是哪种文件系统（fat32 / exfat / ntfs / unknown）。
 
     ⚠️ 必须走 `vdisk`（4.22.1 修）：以前这里是 `open(path,"rb").seek(base)`，
-    按**文件偏移**读。扁平镜像（dd）看不出问题，但 VHD / VHDX / VMDK / E01
+    按**文件偏移**读。扁平镜像（dd）看不出问题，但 VHD / VHDX / VMDK / QCOW2 / E01
     在文件偏移上的字节不是盘上的字节 —— 于是「VHDX 里的 FAT32 分区」会被判成
     `unknown`，`open_fat_volume` 抛「这不是 FAT/exFAT 卷（识别为 未知）」，
     用户拿着一个完好的镜像却被告知格式不对。调用方明明已经用 `_image_kind_at`

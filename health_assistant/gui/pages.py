@@ -5160,7 +5160,7 @@ class RecoveryPage(Page):
         按 0 判断会得到「mbr」，界面就会把四种方式全灰掉。
 
         ⚠️ 必须走 `vdisk`（4.22.0 修）：这里以前直接 `open(path,"rb")` 按文件偏移读。
-        VHD / VHDX / VMDK / **E01** 这类容器里，文件偏移上的字节不是盘上的字节 ——
+        VHD / VHDX / VMDK / QCOW2 / **E01** 这类容器里，文件偏移上的字节不是盘上的字节 ——
         于是判出来是「认不出的格式」，`_mode_key()` 把用户甩进「按文件类型找」，
         真正的「已删除记录 / 格式化残留」反而被藏起来了。容器解得开、这里却按裸文件读，
         等于前功尽弃。
@@ -5621,9 +5621,9 @@ class RecoveryPage(Page):
         path, _flt = QFileDialog.getOpenFileName(
             self, "打开之前做的镜像", self._default_image_dir(),
             "镜像文件 (*.pciimg *.img *.dd *.raw *.bin *.vhd *.vhdx *.vmdk "
-            "*.E01 *.e01 *.E02 *.e02 *.Ex01 *.ex01 *.Ex02 *.ex02);;"
+            "*.qcow2 *.qcow *.E01 *.e01 *.E02 *.e02 *.Ex01 *.ex01 *.Ex02 *.ex02);;"
             "取证镜像 (*.E01 *.e01 *.Ex01 *.ex01 *.L01 *.Lx01);;"
-            "虚拟盘 (*.vhd *.vhdx *.vmdk);;所有文件 (*.*)")
+            "虚拟盘 (*.vhd *.vhdx *.vmdk *.qcow2 *.qcow);;所有文件 (*.*)")
         if not path:
             return
         info = recovery.image_info(path) or {}
@@ -5686,7 +5686,7 @@ class RecoveryPage(Page):
         if knote:
             vkind = f"{vkind}，{knote}" if vkind else knote
         if vkind and vkind != "整盘镜像":
-            # 用户给的是虚拟盘或取证镜像（VHD/VHDX/VMDK/E01/Ex01）：告诉他工具
+            # 用户给的是虚拟盘或取证镜像（VHD/VHDX/VMDK/QCOW2/E01/Ex01）：告诉他工具
             # 已经把外面的壳解开了，免得他以为「我拿的是 .vhdx / .E01，你怎么当裸数据读」。
             self.lb_src.setText(self.lb_src.text() + f"　（已解开：{vkind}）")
         if base:

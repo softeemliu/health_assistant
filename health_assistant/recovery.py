@@ -1329,7 +1329,7 @@ class NtfsVolume:
 class _ImageReader:
     """把镜像文件包成「像原始卷一样可读」的对象（只实现 read / close / size）。
 
-    底层可能是虚拟盘（VHD / VHDX / VMDK），也可能是扁平的 dd 镜像 ——
+    底层可能是虚拟盘（VHD / VHDX / VMDK / QCOW2），也可能是扁平的 dd 镜像 ——
     由 `vdisk.open_path` 认，认出来就自动解开。以前这里只有 `open(path,"rb")`，
     于是「动态 VHD」「VHDX」这类稀疏格式读出来全是映射表，工具只能说一句
     「引导扇区认不出来」，用户根本猜不到真正的原因。
