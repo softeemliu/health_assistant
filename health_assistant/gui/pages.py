@@ -5569,7 +5569,8 @@ class RecoveryPage(Page):
             return
         path, _flt = QFileDialog.getOpenFileName(
             self, "打开之前做的镜像", self._default_image_dir(),
-            "镜像文件 (*.pciimg *.img *.dd *.bin);;所有文件 (*.*)")
+            "镜像文件 (*.pciimg *.img *.dd *.raw *.bin *.vhd *.vhdx *.vmdk);;"
+            "虚拟盘 (*.vhd *.vhdx *.vmdk);;所有文件 (*.*)")
         if not path:
             return
         info = recovery.image_info(path) or {}
@@ -5627,6 +5628,11 @@ class RecoveryPage(Page):
                 "这个文件不是本工具做的镜像（没有 .json 进度文件），"
                 "扫描照常可以做，只是不能断点续传、原盘符也未知。")
         self._set_image(path, letter, base=base, part=part)
+        vkind = getattr(probe, "label", "") or ""
+        if vkind and vkind != "整盘镜像":
+            # 用户给的是虚拟盘（VHD/VHDX/VMDK）：告诉他工具已经把格式解开了，
+            # 免得他以为「我拿的是 .vhdx，你怎么当裸数据读」。
+            self.lb_src.setText(self.lb_src.text() + f"　（已解开：{vkind}）")
         if base:
             self.lb_src.setText(self.lb_src.text() +
                                 f"　用的是 {recovery.boot_label(kind)} 分区，"

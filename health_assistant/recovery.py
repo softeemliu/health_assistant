@@ -53,9 +53,13 @@ import re
 import shutil
 import struct
 import subprocess
+import threading
 import time
 
+from concurrent.futures import ThreadPoolExecutor
+
 from . import carving as _carving
+from . import vdisk as _vdisk
 
 __all__ = [
     "RecoverError", "volumes", "same_volume", "check_target",
@@ -618,8 +622,7 @@ class _ClusterBitmap:
             if data and not data["resident"]:
                 self.runs = [r for r in data["runs"] if not r[2]]
                 self.size = data["real_size"]
-        self._chunk_lcn = -1
-        self._chunk = b""
+        self._chunk = (-1, b"")
 
     def _bytes_of(self, want_off, want_len):
         """把位图逻辑偏移映射到物理位置读出来。"""
@@ -638,15 +641,26 @@ class _ClusterBitmap:
         if not self.runs:
             return None                     # 读不到位图：不知道，别乱判
         off = lcn >> 3
-        cached = (self._chunk_lcn >= 0 and self._chunk_lcn <= off
-                  and off < self._chunk_lcn + len(self._chunk))
-        if not cached:
-            self._chunk_lcn = off
-            self._chunk = self._bytes_of(off, 1 << 20) or b""
-        idx = off - self._chunk_lcn
-        if idx >= len(self._chunk):
+        # 一块缓存用「(起点, 内容)」整体作为一个值替换，**不能分成两个字段写**：
+        # 并行核对内容时，甲刚写完起点、乙就把内容换掉了，甲再用自己的起点配
+        # 乙的内容算偏移 → 判出完全不相干的簇状态（这种错不会报异常）。
+        chunk = self._chunk
+        if not (chunk[0] >= 0 and chunk[0] <= off < chunk[0] + len(chunk[1])):
+            chunk = (off, self._bytes_of(off, 1 << 20) or b"")
+            self._chunk = chunk
+        idx = off - chunk[0]
+        if idx >= len(chunk[1]):
             return None
-        return bool(self._chunk[idx] >> (lcn & 7) & 1)
+        return bool(chunk[1][idx] >> (lcn & 7) & 1)
+
+
+class _OVERLAPPED(ctypes.Structure):
+    """Win32 ``OVERLAPPED``：ReadFile 用它带「本次读的起始偏移」。"""
+    _fields_ = [("Internal", ctypes.c_void_p),
+                ("InternalHigh", ctypes.c_void_p),
+                ("Offset", ctypes.c_uint32),
+                ("OffsetHigh", ctypes.c_uint32),
+                ("hEvent", ctypes.c_void_p)]
 
 
 class _RawVolume:
@@ -686,25 +700,60 @@ class _RawVolume:
         k32.SetFilePointerEx.argtypes = [ctypes.c_void_p, ctypes.c_int64,
                                          ctypes.POINTER(ctypes.c_int64), ctypes.c_uint32]
         k32.SetFilePointerEx.restype = ctypes.c_int
-        h = k32.CreateFileW(self.path, self._GENERIC_READ, self._SHARE_ALL, None,
-                            self._OPEN_EXISTING, self._NO_BUFFERING, None)
+        self._local = threading.local()
+        self._lock = threading.Lock()
+        self._handles = []
+        self._h = self._open()                  # 主句柄：length() / DeviceIoControl 用
+        self._handles.append(self._h)
+
+    def _open(self):
+        h = self._k32.CreateFileW(self.path, self._GENERIC_READ, self._SHARE_ALL, None,
+                                  self._OPEN_EXISTING, self._NO_BUFFERING, None)
         if not h or h == ctypes.c_void_p(self._INVALID).value:
             err = ctypes.get_last_error()
             if err == 5:                        # ERROR_ACCESS_DENIED
                 raise RecoverError(
                     "读不了磁盘原始数据：需要管理员权限。请右键「以管理员身份运行」后再试")
             raise RecoverError(f"打不开 {self.letter}（错误码 {err}）")
-        self._h = h
+        return h
+
+    def _thread_handle(self):
+        """每个线程拿自己的句柄。
+
+        为什么不能共用一个：句柄只有一个文件指针，两个线程同时读会互相踩；
+        而带 ``FILE_FLAG_OVERLAPPED`` 共用句柄做异步读时，``hEvent`` 为空
+        会让并发的 I/O 抢同一份内核状态 —— 实测**直接段错误**（不是读到脏数据，
+        是进程崩）。一线程一句柄多开几次 CreateFileW 就绕开了这两件事。
+        """
+        h = getattr(self._local, "h", None)
+        if h is None:
+            h = self._open()
+            self._local.h = h
+            with self._lock:
+                self._handles.append(h)
+        return h
 
     def close(self):
-        if getattr(self, "_h", None):
+        if not getattr(self, "_h", None):
+            return
+        with self._lock:
+            handles, self._handles = self._handles, []
+        for h in handles:
             try:
-                self._k32.CloseHandle(ctypes.c_void_p(self._h))
-            finally:
-                self._h = None
+                self._k32.CloseHandle(ctypes.c_void_p(h))
+            except Exception:                   # noqa: BLE001
+                pass
+        self._h = None
+        self._local = threading.local()
 
     def read(self, offset, size):
-        """从 offset 读 size 字节（内部按 512 对齐，返回值仍是 offset 起的数据）。"""
+        """从 offset 读 size 字节（内部按 512 对齐，返回值仍是 offset 起的数据）。
+
+        起始偏移写在 OVERLAPPED 里，不动句柄的文件指针；配合「一线程一句柄」，
+        并行读才是安全的。以前是 ``SetFilePointerEx`` + ``ReadFile`` —— 句柄只有
+        一个文件指针，两个线程一起用就互相踩：读回别人位置的字节，或者干脆读空。
+        那样「并行扫描」只会把结果搞错，而不是变快。
+        """
         if not getattr(self, "_h", None):
             raise RecoverError("卷已经关了")
         if size <= 0:
@@ -716,16 +765,16 @@ class _RawVolume:
         raw = ctypes.create_string_buffer(want + SECTOR)
         addr = ctypes.addressof(raw)
         pad = (-addr) % SECTOR
-        pos = ctypes.c_int64(start)
-        if not self._k32.SetFilePointerEx(ctypes.c_void_p(self._h), start, None, 0):
-            raise RecoverError(f"定位 {self.letter} 偏移 {start} 失败")
+        over = _OVERLAPPED()
+        over.Offset = start & 0xFFFFFFFF
+        over.OffsetHigh = (start >> 32) & 0xFFFFFFFF
         got = ctypes.c_uint32(0)
-        ok = self._k32.ReadFile(ctypes.c_void_p(self._h),
+        ok = self._k32.ReadFile(ctypes.c_void_p(self._thread_handle()),
                                 ctypes.c_void_p(addr + pad), want,
-                                ctypes.byref(got), None)
+                                ctypes.byref(got), ctypes.byref(over))
         if not ok:
-            err = ctypes.get_last_error()
-            raise RecoverError(f"读 {self.letter} 失败（错误码 {err}）")
+            raise RecoverError(
+                f"读 {self.letter} 失败（错误码 {ctypes.get_last_error()}）")
         data = raw.raw[pad:pad + got.value]
         head = offset - start
         return data[head:head + size]
@@ -991,13 +1040,14 @@ def open_volume(letter):
 def _image_kind_at(path, base=0):
     """看镜像里 `base` 处的卷首是哪种文件系统。"""
     try:
-        with open(path, "rb") as fh:
-            fh.seek(base)
-            head = fh.read(SECTOR)
-            fh.seek(base + 1024)
-            ext = fh.read(2)
-    except OSError as exc:
-        raise RecoverError(f"打不开镜像文件：{exc}") from exc
+        disk = _vdisk.open_path(path)
+    except _vdisk.VDiskError as exc:
+        raise RecoverError(str(exc)) from exc
+    try:
+        head = disk.read(base, SECTOR)
+        ext = disk.read(base + 1024, 2)
+    finally:
+        disk.close()
     if len(head) < SECTOR:
         return "unknown"
     return boot_kind(head, ext)
@@ -1017,7 +1067,10 @@ def open_image_volume(path, letter=None, base=0, part=None):
     kind = _image_kind_at(path, base)
     if not base and kind in ("mbr", "zero"):
         from . import partitions
-        layout = partitions.list_partitions(path)
+        try:
+            layout = partitions.list_partitions(path)
+        except _vdisk.VDiskError as exc:
+            raise RecoverError(str(exc)) from exc
         usable = [p for p in layout.get("parts") or []
                   if p.get("fs") in ("ntfs", "exfat", "fat32", "fat")]
         if usable:
@@ -1052,6 +1105,7 @@ class NtfsVolume:
         self.path = "\\\\.\\" + self.letter
         self._raw = None
         self._bitmap = None
+        self._bitmap_lock = threading.Lock()
         try:
             self._raw = _RawVolume(self.letter)
         except RecoverError:
@@ -1215,9 +1269,16 @@ class NtfsVolume:
     # ---- 位图 ----
     @property
     def bitmap(self):
-        if self._bitmap is None:
-            self._bitmap = _ClusterBitmap(self)
-        return self._bitmap
+        # 加锁是为了**只建一份**：位图缓存按 1MB 块读，并行核对内容时如果每个
+        # 线程各建一个实例，等于把同一块位图重复读好几遍（而且各自的缓存都不热）。
+        bm = self._bitmap
+        if bm is None:
+            with self._bitmap_lock:
+                bm = self._bitmap
+                if bm is None:
+                    bm = _ClusterBitmap(self)
+                    self._bitmap = bm
+        return bm
 
     def cluster_used(self, lcn):
         return self.bitmap.used(lcn)
@@ -1264,34 +1325,46 @@ class NtfsVolume:
 
 
 class _ImageReader:
-    """把镜像文件包成「像原始卷一样可读」的对象（只实现 read / close / size）。"""
+    """把镜像文件包成「像原始卷一样可读」的对象（只实现 read / close / size）。
+
+    底层可能是虚拟盘（VHD / VHDX / VMDK），也可能是扁平的 dd 镜像 ——
+    由 `vdisk.open_path` 认，认出来就自动解开。以前这里只有 `open(path,"rb")`，
+    于是「动态 VHD」「VHDX」这类稀疏格式读出来全是映射表，工具只能说一句
+    「引导扇区认不出来」，用户根本猜不到真正的原因。
+
+    线程安全由 vdisk 层保证（它给每个线程开自己的句柄）。
+    """
 
     def __init__(self, path, base=0):
         self.path = path
         self.base = max(0, int(base or 0))
-        self._fh = open(path, "rb", buffering=0)
-        self.size = max(0, os.path.getsize(path) - self.base)
+        try:
+            self._disk = _vdisk.open_path(path)
+        except _vdisk.VDiskError as exc:
+            raise RecoverError(str(exc)) from exc
+        self.kind = self._disk.kind
+        self.label = self._disk.label
+        self.size = max(0, self._disk.size - self.base)
 
     def read(self, offset, size):
         if size <= 0 or offset < 0:
             return b""
         if offset >= self.size:
             return b""
-        self._fh.seek(self.base + offset)
-        return self._fh.read(min(size, self.size - offset))
+        return self._disk.read(self.base + offset, min(size, self.size - offset))
 
     def seek_frame(self, base):
         """换个偏移：整盘镜像里「第 N 个分区」就是从那个分区的第一字节当卷首。"""
         self.base = max(0, int(base or 0))
-        self.size = max(0, os.path.getsize(self.path) - self.base)
+        self.size = max(0, self._disk.size - self.base)
         return self
 
     def close(self):
         try:
-            if self._fh is not None:
-                self._fh.close()
+            if self._disk is not None:
+                self._disk.close()
         finally:
-            self._fh = None
+            self._disk = None
 
 
 class BareImageVolume:
@@ -1308,6 +1381,7 @@ class BareImageVolume:
         self._raw = _ImageReader(path, base=base)
         self.base = self._raw.base
         self.kind = "unknown"
+        self.label = getattr(self._raw, "label", "整盘镜像")
         self.total_bytes = self._raw.size
         self.bytes_per_sector = SECTOR
         self.cluster = 4096
@@ -1338,11 +1412,80 @@ class ImageVolume(NtfsVolume):
         self._raw = _ImageReader(path, base=base)
         self.base = self._raw.base
         self._bitmap = None
+        self._bitmap_lock = threading.Lock()
+        # 「整盘镜像」还是「VHDX 动态盘」—— 界面要如实告诉用户工具帮他解开了什么
+        self.label = getattr(self._raw, "label", "整盘镜像")
         try:
             self._parse_boot()
         except Exception:
             self.close()
             raise
+
+
+# ───────────────────────── 并行读盘 ─────────────────────────
+
+_PARALLEL_MIN = 200          # 少于这么多条就别开线程了（开线程本身要一两毫秒）
+_POOL = None                 # 复用的线程池（见 _pool）
+_POOL_SIZE = 0
+_POOL_LOCK = threading.Lock()
+
+
+def _pool(workers):
+    """复用一个线程池，别每次扫描新建。
+
+    每新建一个池就是新起一批线程，而每个线程第一次读盘又会各开一个文件句柄 ——
+    实测连着几次并行就把句柄数从 34 顶到 40，一次完整扫描能攒出几十个。
+    池子留着复用，线程数和句柄数就都稳定了（线程空闲不占 CPU）。
+    """
+    global _POOL, _POOL_SIZE
+    with _POOL_LOCK:
+        if _POOL is None or _POOL_SIZE < workers:
+            _POOL_SIZE = max(workers, _POOL_SIZE, 1)
+            _POOL = ThreadPoolExecutor(max_workers=_POOL_SIZE,
+                                       thread_name_prefix="pci-read")
+        return _POOL
+
+
+def _parallel_workers(n):
+    """并发数：最多 8。
+
+    实测（本机 SSD，1863GB 卷，4KB 随机读 4000 次）：1 线程 6.3k 次/秒、
+    4 线程 33k、8 线程 44k、16 线程 44k —— 4 线程已过半，8 线程封顶。
+    机械盘寻道等待更长，8 线程能掩盖得更多，所以不按 CPU 核数死抠。
+    """
+    try:
+        cpu = os.cpu_count() or 4
+    except Exception:                       # noqa: BLE001
+        cpu = 4
+    return max(1, min(8, cpu, max(1, n // 64)))
+
+
+def _pmap(fn, seq, progress=None, workers=None):
+    """并行 map，**结果顺序与输入完全一致**；进度回调在主线程里调。
+
+    适用的是「一次随机小读 + 一点解析」这类活儿：串行时 CPU 全在等盘，
+    多开线程只是把等待叠起来。纯计算的部分不会变快（GIL 还在）。
+
+    为什么不干脆用 QThreadPool：扫描是纯后台逻辑，`recovery` 不该依赖 GUI 框架。
+    """
+    items = list(seq)
+    n = len(items)
+    if not n:
+        return []
+    w = workers or _parallel_workers(n)
+    if w <= 1 or n < _PARALLEL_MIN:
+        out = []
+        for i, x in enumerate(items):
+            out.append(fn(x))
+            if progress and i % 256 == 0:
+                progress(i, n)
+        if progress:
+            progress(n, n)
+        return out
+    out = list(_pool(w).map(fn, items))
+    if progress:
+        progress(n, n)
+    return out
 
 
 # ───────────────────────── 扫描已删除文件 ─────────────────────────
@@ -1479,10 +1622,13 @@ def scan_deleted(vol, limit=None, budget=None, progress=None, cancel=None,
         n_verify = len(keep) if verify is None else min(verify, len(keep))
         # 逐个核对「内容还在不在」要读盘（每条抽 4 段）：2 万条约 20 秒，
         # 15 万条要 3 分钟 —— 这段时间不报进度的话，界面看起来就是卡死了。
-        for i, it in enumerate(keep[:n_verify]):
-            it["confidence"] = _confidence(v, it)
-            if progress2 and i % 256 == 0:
-                progress2(i, max(n_verify, 1))
+        # 每条都是一次随机小读，串行时全在等盘，所以并行跑（顺序无所谓，
+        # 结果按下标写回，最终排序还是按 confidence + 时间，不受影响）。
+        head = keep[:n_verify]
+        if head:
+            confs = _pmap(lambda it: _confidence(v, it), head, progress=progress2)
+            for it, conf in zip(head, confs):
+                it["confidence"] = conf
         if progress2:
             progress2(n_verify, max(n_verify, 1))
         # 没核对的照实标出来，不冒充 good，也不从列表里删掉
@@ -1494,16 +1640,16 @@ def scan_deleted(vol, limit=None, budget=None, progress=None, cancel=None,
         # 原路径要随机读祖先目录：15.8 万条实测 57 秒，而界面一次只摆 2000 条。
         # 只给最近 path_limit 条算，其余留空 —— 点开某条时再补（那时卷已经打开，
         # 补一条只要几毫秒）。这里不假装「原目录已不在」，留空就是留空。
+        # 同一个目录下的兄弟文件会命中同一份缓存，所以 cache 是**共享**的
+        # （dict 的读写在 CPython 下是原子的，最坏情况是重复算一次）。
         cache = {}
-        missing = 0
+        n_path = len(items) if path_limit is None else min(path_limit, len(items))
+        paths = _pmap(lambda it: v.path_of(it["idx"], cache), items[:n_path])
         for i, it in enumerate(items):
-            if path_limit is not None and i >= path_limit:
-                it["path"] = ""
-                missing += 1
-            else:
-                it["path"] = v.path_of(it["idx"], cache)
+            it["path"] = paths[i] if i < n_path else ""
             it["cluster_count"] = sum(c for _l, c, _sp in it["runs"])
             it.pop("_t", None)
+        missing = len(items) - n_path
 
         stats = {
             "letter": v.letter,
@@ -1754,17 +1900,28 @@ def _refine_items(vol, items, progress=None):
     `progress(已核对, 总数)`：2 万条约 20 秒，不报进度界面看起来就是卡死了。
     """
     total = len(items)
-    for k, it in enumerate(items):
-        if progress and k % 256 == 0:
-            progress(k, max(total, 1))
-        if it.get("confidence") == "name_only":
-            # 只有名字的条目（USN / INDX）本来就没有数据位置，
-            # 重算会被判成 no_data，把「只剩名字」这个更准确的说法丢掉。
-            continue
+    # 只有名字的条目（USN / INDX）本来就没有数据位置，重算会被判成 no_data，
+    # 把「只剩名字」这个更准确的说法丢掉 —— 先剔掉，剩下的才要读盘。
+    pos = [k for k, it in enumerate(items) if it.get("confidence") != "name_only"]
+    pairs = [(k, items[k]) for k in pos]
+
+    def _one(pair):
+        _k, it = pair
         try:
-            it["confidence"] = _confidence(vol, it)
+            return _confidence(vol, it)
         except (RecoverError, OSError):
-            continue
+            return it.get("confidence")
+
+    def _prog(i, _n):
+        # 进度按「在原列表里的位置」报：只报待核对的条数，进度条会停在
+        # 20000/161048 这种小数字上，用户以为卡住了。
+        if progress and pos:
+            progress(pos[min(i, len(pos) - 1)], total)
+
+    if pairs:
+        for (k, _it), conf in zip(pairs, _pmap(_one, pairs, progress=_prog)):
+            if conf:
+                items[k]["confidence"] = conf
     if progress:
         progress(total, max(total, 1))
     return items
@@ -2331,6 +2488,7 @@ def _path_from_map(ref, names, depth=32):
 USN_DELETE = 0x00000200
 USN_RENAME_OLD = 0x00001000
 USN_RENAME_NEW = 0x00002000
+_USN_WANT = USN_DELETE | USN_RENAME_OLD     # 只有这两类记录才需要文件名
 
 USN_REASON_CN = {
     0x00000001: "数据被覆盖", 0x00000002: "数据追加", 0x00000004: "数据截断",
@@ -2340,38 +2498,39 @@ USN_REASON_CN = {
 }
 
 
-def _parse_usn(buf, p):
+_USN_V2 = struct.Struct("<IH2xQQ8xQI12xHH")
+_USN_V3 = struct.Struct("<IH2xQ8xQ16xQI12xHH")
+_USN_HEAD = struct.Struct("<IH")
+
+
+def _parse_usn(buf, p, need_name=0):
     """解析一条 USN 记录。返回 (状态, dict)。
 
     状态：`ok` 解析成功；`more` 这条记录跨过缓冲区尾部（要留到下一块）；
           `bad` 不是记录（跳过）。
     V2 用 8 字节文件引用；V3 用 16 字节（我们只取低 8 字节里的低 48 位记录号，
     高位是序列号，和 MFT 的用法一致）。V4 少见，按 bad 跳过。
+
+    `need_name`：只有 reason 命中这个掩码的记录才解码文件名。
+    为什么加这个：日志里 250 万条记录，真正「删除/改名」的只有十几万 ——
+    每条都 decode 一次 UTF-16 名字，等于 92% 的活儿白干（实测这一步占整个
+    变更日志解析的一半时间）。不需要名字的记录照样按长度前进，不影响遍历。
     """
     if p + 8 > len(buf):
         return "more", None
-    rlen = _u32(buf, p)
-    major = _u16(buf, p + 4)
+    rlen, major = _USN_HEAD.unpack_from(buf, p)
     if major not in (2, 3) or rlen < 0x3C or rlen % 4:
         return "bad", None
     if p + rlen > len(buf):
         return "more", None
-    if major == 2:
-        ref = _u64(buf, p + 8)
-        parent = _u64(buf, p + 16)
-        ts = _u64(buf, p + 32)
-        reason = _u32(buf, p + 40)
-        nlen = _u16(buf, p + 56)
-        noff = _u16(buf, p + 58)
-    else:
-        ref = _u64(buf, p + 8)
-        parent = _u64(buf, p + 24)
-        ts = _u64(buf, p + 48)
-        reason = _u32(buf, p + 56)
-        nlen = _u16(buf, p + 72)
-        noff = _u16(buf, p + 74)
+    st = _USN_V2 if major == 2 else _USN_V3
+    _rlen, _major, ref, parent, ts, reason, nlen, noff = st.unpack_from(buf, p)
     if nlen > 1024 or noff + nlen > rlen:
         return "bad", None
+    if need_name and not (reason & need_name):
+        # 用不上的记录：不解名字，直接按长度跳过（省掉 decode 和字符串分配）
+        return "ok", {"ref": 0, "parent": 0, "usn_time": 0, "reason": reason,
+                      "name": "", "length": rlen}
     name = buf[p + noff:p + noff + nlen].decode("utf-16-le", "replace")
     if not name or "\x00" in name:
         return "bad", None
@@ -2499,7 +2658,7 @@ def usn_records(vol, budget=None, limit=200000, progress=None, cancel=None,
                 scanned += len(chunk)
                 i = 0
                 while True:
-                    state, r = _parse_usn(buf, i)
+                    state, r = _parse_usn(buf, i, _USN_WANT)
                     if state == "more":
                         break                   # 尾部不完整，留到下一块
                     if state == "bad":

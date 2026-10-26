@@ -77,17 +77,17 @@ def find_boot_sectors(path, limit_bytes=64 << 30, progress=None, cancel=None):
     """
     out = []
     chunk = 1 << 20
-    fh = open(path, "rb")
+    from . import vdisk
+
+    disk = vdisk.open_path(path)
     try:
-        fh.seek(0, 2)
-        total = fh.tell()
+        total = disk.size
         end = min(total, limit_bytes)
         pos = 0
         while pos < end:
             if cancel and cancel():
                 break
-            fh.seek(pos)
-            buf = fh.read(min(chunk, end - pos))
+            buf = disk.read(pos, min(chunk, end - pos))
             if not buf:
                 break
             for sig, _hint in _FS_SIGS:
@@ -110,7 +110,7 @@ def find_boot_sectors(path, limit_bytes=64 << 30, progress=None, cancel=None):
             if progress:
                 progress(min(pos, end), end)
     finally:
-        fh.close()
+        disk.close()
     out.sort(key=lambda p: p["offset"])
     # FAT32 在第 6 个扇区存了一份**备份引导扇区**，内容和主引导扇区几乎一模一样，
     # 所以按签名扫必然二次命中（实测：主 1048576、备份 1051648，正好差 6 个扇区）。
@@ -211,14 +211,18 @@ def list_partitions(path):
 
     返回 `{"scheme", "parts": [...], "note"}`。每个分区带 `fs`（探测到的文件系统）。
     支持 MBR、GPT，以及「两者都没有但 0 偏移直接是 NTFS」的单分区镜像。
+
+    镜像可能是虚拟盘（VHD / VHDX / VMDK），统一交给 `vdisk` 解成扁平字节流 ——
+    否则读到的是映射表而不是分区表。
     """
-    fh = open(path, "rb")
+    from . import vdisk
+
+    disk = vdisk.open_path(path)
     try:
-        head = fh.read(SECTOR)
+        head = disk.read(0, SECTOR)
 
         def read_at(off, size):
-            fh.seek(off)
-            return fh.read(size)
+            return disk.read(off, size)
 
         if len(head) < SECTOR:
             return {"scheme": "none", "parts": [], "note": "这个文件连 512 字节都不到"}
@@ -234,10 +238,7 @@ def list_partitions(path):
             # 没分区表：也许 0 偏移直接就是文件系统（有的人只 dd 了一个分区）
             fs = _probe_fs(read_at, 0)
             if fs and fs != "zero":
-                try:
-                    total = fh.seek(0, 2)
-                except OSError:
-                    total = 0
+                total = disk.size
                 return {"scheme": "flat", "parts": [{
                     "index": 0, "type": fs, "scheme": "flat", "offset": 0,
                     "size": total, "fs": fs, "name": "整个文件"}],
@@ -248,5 +249,5 @@ def list_partitions(path):
             p["fs"] = _probe_fs(read_at, p["offset"])
         return {"scheme": scheme, "parts": parts, "note": note}
     finally:
-        fh.close()
+        disk.close()
 
