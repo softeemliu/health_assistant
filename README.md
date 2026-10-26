@@ -124,7 +124,7 @@ health_assistant/            源码包
   recovery.py                NTFS 恢复：MFT / $INDX / $USN / 修复 / 镜像 / 导出
   fatfs.py                   FAT12/16/32 与 exFAT 的目录项解析
   partitions.py              MBR / GPT 解析、按引导扇区签名找回分区
-  vdisk.py                   VHD / VHDX / VMDK / E01 / Ex01 虚拟盘与取证镜像 → 扁平字节流
+  vdisk.py                   VHD / VHDX / VMDK / QCOW2 / E01 / Ex01 虚拟盘与取证镜像 → 扁平字节流
   lznt1.py                   NTFS 压缩解包
   catalog.py                 扫描结果存档（.pcirc）与筛选
   smart.py  metrics.py  ...  采集层
