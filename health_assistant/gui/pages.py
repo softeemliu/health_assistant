@@ -5621,8 +5621,8 @@ class RecoveryPage(Page):
         path, _flt = QFileDialog.getOpenFileName(
             self, "打开之前做的镜像", self._default_image_dir(),
             "镜像文件 (*.pciimg *.img *.dd *.raw *.bin *.vhd *.vhdx *.vmdk "
-            "*.E01 *.e01 *.E02 *.e02 *.Ex01 *.ex01);;"
-            "取证镜像 E01 (*.E01 *.e01 *.Ex01 *.ex01);;"
+            "*.E01 *.e01 *.E02 *.e02 *.Ex01 *.ex01 *.Ex02 *.ex02);;"
+            "取证镜像 (*.E01 *.e01 *.Ex01 *.ex01 *.L01 *.Lx01);;"
             "虚拟盘 (*.vhd *.vhdx *.vmdk);;所有文件 (*.*)")
         if not path:
             return
@@ -5686,8 +5686,8 @@ class RecoveryPage(Page):
         if knote:
             vkind = f"{vkind}，{knote}" if vkind else knote
         if vkind and vkind != "整盘镜像":
-            # 用户给的是虚拟盘或取证镜像（VHD/VHDX/VMDK/E01）：告诉他工具已经把
-            # 外面的壳解开了，免得他以为「我拿的是 .vhdx / .E01，你怎么当裸数据读」。
+            # 用户给的是虚拟盘或取证镜像（VHD/VHDX/VMDK/E01/Ex01）：告诉他工具
+            # 已经把外面的壳解开了，免得他以为「我拿的是 .vhdx / .E01，你怎么当裸数据读」。
             self.lb_src.setText(self.lb_src.text() + f"　（已解开：{vkind}）")
         if base:
             self.lb_src.setText(self.lb_src.text() +

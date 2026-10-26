@@ -592,21 +592,31 @@ class ExfatImageVolume(ExfatVolume):
             raise
 
 
+def image_kind(path, base=0):
+    """镜像里 `base` 处的卷首是哪种文件系统（fat32 / exfat / ntfs / unknown）。
+
+    ⚠️ 必须走 `vdisk`（4.22.1 修）：以前这里是 `open(path,"rb").seek(base)`，
+    按**文件偏移**读。扁平镜像（dd）看不出问题，但 VHD / VHDX / VMDK / E01
+    在文件偏移上的字节不是盘上的字节 —— 于是「VHDX 里的 FAT32 分区」会被判成
+    `unknown`，`open_fat_volume` 抛「这不是 FAT/exFAT 卷（识别为 未知）」，
+    用户拿着一个完好的镜像却被告知格式不对。调用方明明已经用 `_image_kind_at`
+    （走 vdisk）认出是 fat32 了，这里又重新按裸文件读一遍，等于白认。
+
+    判据只有一份：`recovery._image_kind_at`（`open_image_volume` 路由用的就是它）。
+    这里再抄一遍「怎么读引导扇区」的话，两边迟早会走岔 —— 这一版就是栽在抄出来的
+    第二份上。所以这里只做转发。
+    """
+    from .recovery import _image_kind_at
+    return _image_kind_at(path, base)
+
+
 def open_fat_volume(letter_or_path, is_image=False, base=0):
     """按引导扇区自动选 FAT 还是 exFAT，返回卷对象。认不出抛 RecoverError。"""
-    from .recovery import RecoverError, boot_kind
+    from .recovery import RecoverError
     probe = letter_or_path
     kind = ""
     if is_image:
-        try:
-            with open(probe, "rb") as fh:
-                fh.seek(base)              # 整盘镜像里卷首在分区起点，不是文件头
-                head = fh.read(512)
-                fh.seek(base + 1024)
-                ext = fh.read(2)
-            kind = boot_kind(head, ext)
-        except OSError as exc:
-            raise RecoverError(f"打不开镜像：{exc}") from exc
+        kind = image_kind(probe, base)
     else:
         from .recovery import probe_volume
         kind = (probe_volume(probe) or {}).get("kind") or ""
@@ -640,6 +650,11 @@ def scan_deleted(vol, limit=3000, budget=120, progress=None, cancel=None):
     到点就带着已有结果返回，并标 `truncated`。
     """
     from .recovery import (_confidence, RecoverError, _letter_norm)
+
+    # `recovery.scan_deleted` 的 limit 语义是「None = 全部」，4.20.0 起那边默认就是 None。
+    # 这里以前直接 `limit * 4` 算上限，传 None 立刻 TypeError —— 文档说「参数保持一致」
+    # 就得不只是口头一致。`recovery` 那条路会替它换成 20 万，但直接用这个函数就会崩。
+    limit = 10 ** 9 if limit is None else int(limit)
 
     own = not isinstance(vol, _FatBase)
     if own:

@@ -48,7 +48,7 @@
 | 记录也被覆盖 / 盘被格式化 | 按文件类型在未分配空间里 carving：**23 类 / 30+ 扩展名**，按结构走完整个文件（大视频、大压缩包也切得准），默认扫整个未分配区 |
 | 整盘镜像（0 偏移是分区表） | 解析 MBR/GPT 自动定位分区；分区表丢了可按引导扇区签名找回来 |
 | 虚拟盘（VHD / VHDX / VMDK） | 直接拖进「打开已有镜像」，动态盘/稀疏盘内部有块映射表，工具自己解开 |
-| 取证镜像（E01） | 直接打开，**分卷（.E01/.E02/…）同目录自动凑齐**，压缩块逐块解压校验；Ex01 / L01 / QCOW2 会告诉你是什么格式、怎么转 |
+| 取证镜像（E01 / Ex01） | 直接打开，**分卷同目录自动凑齐**（.E01/.E02/…、.Ex01/.Ex02/…），压缩块逐块解压校验（deflate / bzip2 / 不压缩 / 填充块）；L01 / Lx01 / QCOW2 会告诉你是什么格式、怎么转 |
 
 细节上做了这些：
 
@@ -124,7 +124,7 @@ health_assistant/            源码包
   recovery.py                NTFS 恢复：MFT / $INDX / $USN / 修复 / 镜像 / 导出
   fatfs.py                   FAT12/16/32 与 exFAT 的目录项解析
   partitions.py              MBR / GPT 解析、按引导扇区签名找回分区
-  vdisk.py                   VHD / VHDX / VMDK / E01 虚拟盘与取证镜像 → 扁平字节流
+  vdisk.py                   VHD / VHDX / VMDK / E01 / Ex01 虚拟盘与取证镜像 → 扁平字节流
   lznt1.py                   NTFS 压缩解包
   catalog.py                 扫描结果存档（.pcirc）与筛选
   smart.py  metrics.py  ...  采集层

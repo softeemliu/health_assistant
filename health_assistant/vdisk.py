@@ -15,16 +15,19 @@
   · VMDK monolithicSparse     （VMware）
   · dd 裸镜像 / 任意扁平字节流（原样透传）
 
-  · E01（EWF 取证格式，EnCase 1~7 / FTK Imager / linen 都产出这种）
+  · E01（EWF 第一版，EnCase 1~6 / FTK Imager / linen 都产出这种）
+  · Ex01（EWF 第二版，EnCase 7 之后）
 
 不支持的（识别出来就给明确指引，不假装是坏镜像）：
-  · Ex01 / L01（EWF 第二版、逻辑取证文件）、QCOW2、差分盘、压缩 VMDK
+  · L01 / Lx01（逻辑取证文件，里面是挑出来的文件、不是盘）、QCOW2、
+    差分盘（VHD differencing）、加密的 Ex01
 
-全程只读。所有多字节字段：VHD 是**大端**，VHDX / VMDK / E01 是**小端**。
+全程只读。所有多字节字段：VHD 是**大端**，VHDX / VMDK / E01 / Ex01 是**小端**。
 """
 from __future__ import annotations
 
 import array
+import bz2
 import os
 import re
 import struct
@@ -35,16 +38,6 @@ import zlib
 SECTOR = 512
 
 # ───────────────────────── 用户能看懂的错误 ─────────────────────────
-
-_E01_HINT = (
-    "这是一份 **E01 取证镜像**（EWF 格式，专业取证/实验室交付常用），"
-    "不是普通的整盘镜像。\n\n"
-    "这个版本暂时读不了这个文件：**E01 第二版（.Ex01）** 是 EnCase 7 之后的新格式，"
-    "文件结构跟老 E01 不一样。\n\n"
-    "可以这样转成裸镜像后再打开：\n"
-    "· FTK Imager（免费）：打开这个 Ex01，用「Export Disk Image」导出 raw；\n"
-    "· 命令行 ewfexport（libewf）：`ewfexport -f raw -t out image.Ex01`；\n"
-    "· 转出来的 .raw/.dd/.img 直接在这里打开就行。")
 
 _L01_HINT = (
     "这是一个 **逻辑取证文件（.L01）**，不是磁盘镜像。\n\n"
@@ -520,6 +513,10 @@ _SEC_DESC = 76          # section 描述符长度，所有 section 都一样
 _SEC_PAD = 72           # 校验和覆盖描述符前 72 字节（Adler-32）
 
 
+def _u16(b, off):
+    return struct.unpack_from("<H", b, off)[0] if len(b) >= off + 2 else 0
+
+
 def _u32(b, off):
     return struct.unpack_from("<I", b, off)[0] if len(b) >= off + 4 else 0
 
@@ -892,6 +889,488 @@ def _bsearch(firsts, idx):
     return lo - 1 if lo > 0 else -1
 
 
+# ─────────────────── EWF 第二版（Ex01 / EnCase 7+）───────────────────
+#
+# 和 E01 长得像但**不能照搬**，四处是反的：
+#   · section 描述符在**段的末尾**，而且是**从后往前走**（描述符里记的是「上一段在哪」）；
+#   · 描述符 64 字节（E01 是 76），字段全是定长二进制（E01 用 "volume"/"sectors" 字符串）；
+#   · 块表项 16 字节、块偏移 **8 字节且是段内绝对偏移**（E01 是 4 字节相对基准偏移，
+#     最高位还兼作压缩标志）；
+#   · 每块扇区数 / 每扇区字节数 不在「volume 段」里，而在**设备信息段 + 案件信息段**
+#     的「序列化对象字符串」里（UTF-16 的 `1\nmain\n标签行\n值行\n`）。
+#
+# 依据：libewf 的 EWF2 规范 + libewf 参考实现（libewf_section_descriptor.c 里
+# `start_offset = previous_offset + 64`、`size = end_offset - start_offset`，
+# `libewf_segment_file.c` 里 `segment_file_offset -= section_descriptor->size`）。
+# 这两处只看规范是读不出确切含义的，所以对着实现核过。
+
+_EX01_LX_SIG = b"LEF2\r\n\x81\x00"      # Lx01（EWF2 逻辑取证）的段文件头
+
+_EX01_LX01_HINT = (
+    "这是一份 **Lx01 逻辑取证文件**（EWF 第二版的逻辑取证格式，只装挑出来的文件，"
+    "不是整块盘）。\n\n"
+    "它不是盘，所以没法按「已删除记录 / 格式化残留」去扫。要恢复文件内容的话：\n"
+    "· 用 FTK Imager（免费）打开它，把里面的文件导出到本地磁盘再处理；\n"
+    "· 或者用 ewfexport（libewf）：`ewfexport -t out image.Lx01`。")
+
+_EX01_ENCRYPTED_HINT = (
+    "这份 Ex01 是**加密**的（段文件头里声明了加密，或者出现了加密密钥段）。\n"
+    "加密镜像必须用原来的口令解开，工具不会去猜口令。\n\n"
+    "可以在采集软件（EnCase / FTK Imager）里用口令解密后导出成裸镜像，再打开这里。")
+
+_EX01_TYPE_DEVICE_INFO = 0x00000001
+_EX01_TYPE_CASE_DATA = 0x00000002
+_EX01_TYPE_SECTOR_DATA = 0x00000003
+_EX01_TYPE_SECTOR_TABLE = 0x00000004
+_EX01_TYPE_ENCRYPTION = 0x0000000b
+_EX01_TYPE_NEXT = 0x0000000d
+_EX01_TYPE_DONE = 0x0000000f
+_EX01_DESC = 64                      # 描述符长度（含自身）
+_EX01_HDR = 32                       # 段文件头长度
+
+_EX01_COMP_NONE = 0
+_EX01_COMP_DEFLATE = 1
+_EX01_COMP_BZIP2 = 2
+
+_FLAG_COMPRESSED = 0x00000001
+_FLAG_CHECKSUMED = 0x00000002
+_FLAG_PATTERN = 0x00000004
+
+
+def _ex01_segments(path):
+    """同一套 Ex01 的所有分卷，按**文件头里的段号**（偏移 12，4 字节）排序。
+
+    不能按扩展名排：EnCase 过了 .Ex99 会接着写 .ExAA、.ExZZ、.EyAA…，扩展名的
+    字典序和实际顺序一致但极易踩坑（.Ex1A vs .Ex01），而段号是文件自己写的，
+    不会骗人。所以这里跟 E01 一样，认文件头，不认文件名。
+    """
+    path = os.path.abspath(path)
+    folder, name = os.path.split(path)
+    stem, _ext = os.path.splitext(name)
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        names = []
+    found = []
+    for fn in names:
+        s2, e2 = os.path.splitext(fn)
+        if s2.lower() != stem.lower() or not _EWF_EXT_RE.match(e2 or ""):
+            continue
+        found.append(os.path.join(folder, fn))
+    if path not in found:
+        found.append(path)
+    segs = []
+    for p in found:
+        try:
+            with open(p, "rb") as fh:
+                head = fh.read(_EX01_HDR)
+        except OSError:
+            continue
+        if not head.startswith(_EWF2_SIG):
+            continue
+        num = _u32(head, 12) if len(head) >= 16 else 0
+        segs.append((num or (1 << 30), p))
+    segs.sort()
+    return [p for _n, p in segs]
+
+
+def _ex01_sections(h, total):
+    """走一遍 Ex01 段文件里的 section 链，按**物理顺序**返回。
+
+    和 E01 相反：描述符在末尾，链是「后 → 前」。做法是从文件末尾 64 字节处读
+    描述符，然后 `偏移 -= 本段总长`（总长 = 数据 + 补位 + 描述符自身 64 字节）
+    跳到上一段的描述符。所以最后拿到的是倒序，返回前 reverse 一下。
+
+    每段的实际数据范围 = [上一段描述符偏移 + 64, 本描述符偏移)；第一段的起点
+    是段文件头之后（32 字节）。描述符自带的 Adler-32 对不上就说明链坏了，
+    直接停 —— 宁可少解析几段，也不拿错位的字节冒充数据。
+    """
+    out = []
+    off = total - _EX01_DESC
+    guard = 0
+    while off > _EX01_HDR and guard < 1 << 20:
+        guard += 1
+        raw = h.pread(off, _EX01_DESC)
+        if len(raw) < _EX01_DESC:
+            break
+        if (_adler(raw[:60]) & 0xFFFFFFFF) != _u32(raw, 60):
+            break                        # 描述符校验不过：链到这里就断了
+        typ = _u32(raw, 0)
+        flags = _u32(raw, 4)
+        prev = _u64(raw, 8)
+        data_size = _u64(raw, 16)
+        pad = _u32(raw, 28)
+        start = (prev + _EX01_DESC) if prev else _EX01_HDR
+        if not (_EX01_HDR <= start <= off):
+            break
+        out.append({
+            "type": typ, "flags": flags, "start": start, "end": off,
+            "data_size": data_size, "padding": pad, "desc": off,
+        })
+        if typ in (_EX01_TYPE_NEXT, _EX01_TYPE_DONE) and len(out) > 1:
+            # next/done 是段的最后一段，继续往前也没有意义（但保留它，里面没数据）
+            pass
+        off = start - _EX01_DESC
+    out.reverse()
+    return out
+
+
+def _object_values(raw):
+    """把「序列化对象字符串」拆成 {标签: 值}。
+
+    真实格式（拿 libewf 里从真实镜像摘出来的 device_information 核对过）：
+    `BOM + "1\\nmain\\n<标签1>\\t<标签2>…\\n<值1>\\t<值2>…\\n\\n"`，UTF-16LE。
+    值和标签**按位置对应**，空值就是两个制表符挨着。所以不能按 `=` 或 `:` 去猜，
+    也不能假设值里有几个空格就切开 —— 型号名里有空格（"Flash Disk"）。
+    """
+    if not raw:
+        return {}
+    if raw[:2] == b"\xff\xfe":
+        text = raw.decode("utf-16-le", "ignore")
+    elif raw[:2] == b"\xfe\xff":
+        text = raw.decode("utf-16-be", "ignore")
+    else:                                # 少数实现直接写单字节文本
+        text = raw.decode("utf-8", "ignore")
+    text = text.replace("\ufeff", "").replace("\x00", "")
+    lines = text.split("\n")
+    if len(lines) < 4:
+        return {}
+    tags = [t.strip() for t in lines[2].split("\t")]
+    vals = lines[3].split("\t")
+    out = {}
+    for i, tag in enumerate(tags):
+        if not tag:
+            continue
+        val = vals[i].strip() if i < len(vals) else ""
+        # 有的采集软件会在第一个值前面塞一个控制字符（实测 EnCase 的 sn 就是），
+        # 只留可打印内容，免得把垃圾字节当成型号/容量
+        val = "".join(ch for ch in val if ch.isprintable())
+        out[tag] = val
+    return out
+
+
+class _Ex01Disk(VDisk):
+    """Ex01（EWF 第二版）：分卷 + 压缩块 → 一块能按字节读的盘。
+
+    读盘路径和 E01 一样：`read(off, n)` → 落在第几块 → 解那块 → 切片。
+    每线程一个块缓存（扫描是顺序读 + 少量回头）。
+
+    不信任的两处（都有实证兜底，不猜）：
+      · 块表项里的偏移是「段内绝对偏移」，理论上无需基准；但真出现对不上的镜像时，
+        依次试「绝对」和「相对本段数据段起点」，**拿第一块真解一遍**，解得开才算；
+      · 块大小以设备信息（每扇区字节数）/ 案件信息（每块扇区数）为准，读不到时
+        才从第一块反推（未压缩块 = 长度 - 4 字节校验和；压缩块 = 解出来的长度）。
+    """
+
+    kind = "ex01"
+    label = "Ex01 取证镜像"
+
+    def __init__(self, path):
+        self._path = path
+        self._segs = []
+        self._comp = []            # 每段的压缩方法（0 不压 / 1 deflate / 2 bzip2）
+        self._tables = []          # [(起始块号, 块数, 段下标, 基准偏移, 条目列表)]
+        self._firsts = []          # 每张表的起始块号，给 bisect 用
+        self._chunk_n = 0
+        self._chunk_size = 0
+        self._sectors = 0
+        self._bps = 0
+        self._chunk_n_want = 0
+        self._bad = 0
+        self._tl = threading.local()
+        self.note = ""
+        self.encrypted = False
+        paths = _ex01_segments(path)
+        if not paths:
+            raise VDiskError("这不是 Ex01 镜像（文件头标记对不上）")
+        for p in paths:
+            self._segs.append(_Handles(p))
+        try:
+            self._load()
+        except Exception:
+            self.close()
+            raise
+        if self.encrypted:
+            self.close()
+            raise VDiskError(_EX01_ENCRYPTED_HINT)
+        if not self._chunk_size or not self.size:
+            self.close()
+            raise VDiskError("这份 Ex01 读不出「块大小 / 盘有多大」，"
+                             "文件可能被截断、分卷不齐，或者块表坏了")
+
+    # ── 打开时的解析 ──────────────────────────────────────────────
+
+    def _headers(self):
+        """读每段的文件头：压缩方法 + 是否声明了加密。"""
+        for h in self._segs:
+            head = h.pread(0, _EX01_HDR)
+            if len(head) < _EX01_HDR:
+                self._comp.append(_EX01_COMP_DEFLATE)
+                continue
+            self._comp.append(_u16(head, 10))
+            # 段文件头的第 2 位没有公开的「加密」标志，加密只体现在加密密钥段上，
+            # 所以这儿不做判断，留给 _load() 里看有没有 0x0b 段。
+
+    def _load(self):
+        self._headers()
+        dev = {}
+        case = {}
+        tables = []            # [(段下标, 表格子, 段数据起点)]
+        for si, h in enumerate(self._segs):
+            try:
+                total = os.path.getsize(h.path)
+            except OSError:
+                continue
+            if total < _EX01_HDR + _EX01_DESC:
+                continue
+            sect_start = 0
+            for sec in _ex01_sections(h, total):
+                typ = sec["type"]
+                if typ == _EX01_TYPE_DEVICE_INFO and not dev:
+                    dev = _object_values(h.pread(sec["start"], min(sec["end"] - sec["start"], 1 << 16)))
+                elif typ == _EX01_TYPE_CASE_DATA and not case:
+                    case = _object_values(h.pread(sec["start"], min(sec["end"] - sec["start"], 1 << 16)))
+                elif typ == _EX01_TYPE_SECTOR_DATA:
+                    sect_start = sec["start"]
+                elif typ == _EX01_TYPE_SECTOR_TABLE:
+                    tables.append((si, sec, sect_start))
+                elif typ == _EX01_TYPE_ENCRYPTION:
+                    self.encrypted = True
+        self._from_values(dev, case)
+        for si, sec, sect_start in tables:
+            self._add_table(si, sec, sect_start)
+        if not self._chunk_size:
+            self._guess_chunk_size(tables)
+        if not self._chunk_n:
+            raise VDiskError("这份 Ex01 里一块数据都没找到 —— 文件可能被截断，"
+                             "也可能分卷不齐（只给了一部分 .Ex01/.Ex02…），或者块表坏了")
+        want = self._sectors * self._bps if (self._sectors and self._bps) else 0
+        total = self._chunk_n * self._chunk_size
+        self.size = min(want, total) if want else total
+        miss = self._chunk_n_want - self._chunk_n
+        if miss > 0:
+            self.note = (f"块表里只有 {self._chunk_n} 块，镜像自称 {self._chunk_n_want} 块"
+                         f"（少 {miss} 块，分卷可能不齐），缺的部分按 0 读")
+        elif want and total < want:
+            self.note = (f"数据比镜像自称的少 {want - total} 字节，缺的部分按 0 读")
+        elif len(self._segs) > 1:
+            self.label = f"Ex01 取证镜像（{len(self._segs)} 个分卷）"
+
+    def _from_values(self, dev, case):
+        """从设备信息 / 案件信息里取容量和块大小。取不到就留空，后面再反推。"""
+        bps = _as_int(dev.get("bp"))
+        secs = _as_int(dev.get("ts"))
+        spc = _as_int(case.get("sb"))
+        nchunk = _as_int(case.get("tb"))
+        if bps and 128 <= bps <= 1 << 16 and (bps & (bps - 1)) == 0:
+            self._bps = bps
+        if secs and 0 < secs < (1 << 48):
+            self._sectors = secs
+        if spc and self._bps and 0 < spc <= 1 << 20 and SECTOR <= spc * self._bps <= 64 << 20:
+            self._chunk_size = spc * self._bps
+        if nchunk and 0 < nchunk < (1 << 40):
+            self._chunk_n_want = nchunk
+
+    def _add_table(self, si, sec, sect_start):
+        """读一张块表：20 字节头 + 12 字节补位 + 16 字节 × N 条目 + 16 字节尾。
+
+        条目里 [0:8] 偏移、[8:12] 长度、[12:16] 标志。偏移按「段内绝对」解释；
+        对不上就把本段数据段起点当基准再试一次，两次都拿**第一块真去解**来验。
+        """
+        h = self._segs[si]
+        start = sec["start"]
+        hdr = h.pread(start, 32)
+        if len(hdr) < 32:
+            return
+        first_chunk = _u64(hdr, 0)
+        n = _u32(hdr, 8)
+        if not 0 < n < (1 << 24):
+            return
+        raw = h.pread(start + 32, n * 16)
+        n = min(n, len(raw) // 16)
+        if n <= 0:
+            return
+        entries = []
+        for i in range(n):
+            base = i * 16
+            entries.append((_u64(raw, base), _u32(raw, base + 8), _u32(raw, base + 12)))
+        limit = sec["desc"]                  # 本段数据不会跑到自己的描述符之后
+        chosen = None
+        for base in ([0, sect_start] if sect_start else [0]):
+            if self._verify(h, entries, base, limit, self._comp[si]):
+                chosen = base
+                break
+        if chosen is None:
+            chosen = 0                       # 都不通也先收下，坏块会按 0 读并计数
+        self._firsts.append(self._chunk_n)
+        self._tables.append((self._chunk_n, n, si, chosen, entries))
+        self._chunk_n += n
+
+    def _verify(self, h, entries, base, limit, comp):
+        """按这种解释读前几块：**真能解出来**才算解释对，解不出来就不算。
+
+        两处刻意避开：
+          · 填充块不参与判断 —— 它的偏移字段里装的是 8 字节图案（常常就是 0），
+            拿去算位置会得到 offset=0、被判成「基准不对」，于是白白换错基准；
+          · 未压缩且没有校验和的块也**不能**用来判断 —— 随便一段字节它都「成功」，
+            等于没验。只认「压缩解得开」和「Adler-32 对得上」这两件强证据。
+        """
+        strong = 0
+        for off, size, flags in entries[:8]:
+            if flags & _FLAG_PATTERN and flags & _FLAG_COMPRESSED:
+                continue
+            if size <= 0 or size > (64 << 20):
+                return False
+            pos = base + off
+            if not (0 < pos < limit):
+                return False
+            data, ok = self._decode(h.pread(pos, size), size, flags, comp, strict=True)
+            if ok and data:
+                strong += 1
+        return strong > 0
+
+    def _guess_chunk_size(self, tables):
+        """设备/案件信息都读不到时，从第一块反推块大小。"""
+        for si, sec, _ss in tables:
+            h = self._segs[si]
+            hdr = h.pread(sec["start"], 32)
+            n = _u32(hdr, 8) if len(hdr) >= 12 else 0
+            if not 0 < n:
+                continue
+            raw = h.pread(sec["start"] + 32, 16)
+            if len(raw) < 16:
+                continue
+            off, size, flags = _u64(raw, 0), _u32(raw, 8), _u32(raw, 12)
+            if flags & _FLAG_PATTERN:
+                continue
+            data, ok = self._decode(h.pread(off, size), size, flags, self._comp[si])
+            if ok and data:
+                self._chunk_size = len(data)
+                self._bps = SECTOR
+                return
+
+    # ── 按块取数据 ────────────────────────────────────────────────
+
+    def _decode(self, raw, size, flags, comp, strict=False):
+        """一块的原始字节 → (数据, 是否可信)。
+
+        四种情况（全按规范，不按「看起来像」猜）：
+          · 压缩 + 填充：读盘无意义，偏移字段就是 8 字节填充图案，重复铺满；
+          · 压缩：deflate 或 bzip2，解出来的长度必须 ≤ 块大小；
+          · 未压缩 + 校验和：末尾 4 字节是 Adler-32，对得上才认；
+          · 未压缩：原样。
+        解不开 / 校验不过 → 返回 (None, False)，由调用方按 0 读，绝不编内容。
+        """
+        if not raw:
+            return None, False
+        if flags & _FLAG_COMPRESSED:
+            try:
+                if comp == _EX01_COMP_BZIP2:
+                    d = bz2.BZ2Decompressor().decompress(raw, max_length=self._chunk_size + 1)
+                else:
+                    d = zlib.decompressobj().decompress(raw, self._chunk_size + 1)
+            except (zlib.error, OSError, ValueError):
+                return None, False
+            if not d:
+                return None, False
+            if self._chunk_size and len(d) > self._chunk_size:
+                return None, False
+            return d, True
+        if flags & _FLAG_CHECKSUMED and len(raw) >= 4:
+            body = raw[:len(raw) - 4]
+            if (_adler(body) & 0xFFFFFFFF) == _u32(raw, len(raw) - 4):
+                return body, True
+            return None, False                     # 校验和对不上 = 这块不可信，按 0 读
+        if strict:
+            # 判断「基准对不对」时，没有校验和的块等于没有证据，不能算通过
+            return None, False
+        return raw, True
+
+    def _load_index(self, idx):
+        i = _bsearch(self._firsts, idx)
+        if i < 0:
+            return None
+        first, n, si, base, entries = self._tables[i]
+        j = idx - first
+        if not 0 <= j < n:
+            return None
+        off, size, flags = entries[j]
+        if flags & _FLAG_PATTERN and flags & _FLAG_COMPRESSED:
+            # 填充块：偏移字段里装的是 8 字节图案（按小端原样），重复铺满一块
+            pat = struct.pack("<Q", off)
+            return (pat * (self._chunk_size // 8 + 1))[:self._chunk_size]
+        data, ok = self._decode(self._segs[si].pread(base + off, size), size,
+                               flags, self._comp[si])
+        if not ok:
+            self._bad += 1
+        return data
+
+    def _chunk_at(self, idx):
+        local = self._tl
+        cache = getattr(local, "cache", None)
+        if cache is None:
+            cache = local.cache = {}
+        data = cache.get(idx)
+        if data is None and idx not in cache:
+            data = self._load_index(idx)
+            if len(cache) >= 8:
+                cache.pop(next(iter(cache)))
+            cache[idx] = data
+        return data
+
+    # ── 对外 ──────────────────────────────────────────────────────
+
+    def read(self, off, n):
+        if off < 0 or off >= self.size or n <= 0:
+            return b""
+        n = min(n, self.size - off)
+        cs = self._chunk_size
+        out = bytearray()
+        pos = off
+        left = n
+        while left > 0:
+            idx = pos // cs
+            inner = pos % cs
+            take = min(left, cs - inner)
+            data = self._chunk_at(idx)
+            if data and len(data) >= inner + take:
+                out += data[inner:inner + take]
+            elif data:
+                piece = data[inner:inner + take]
+                out += piece + bytes(take - len(piece))
+            else:                              # 坏块 / 缺块：按 0 读，不编内容
+                out += bytes(take)
+            pos += take
+            left -= take
+        return bytes(out)
+
+    def close(self):
+        for h in self._segs:
+            h.close()
+        self._segs = []
+        self._tables = []
+        self._tl = threading.local()
+
+
+def _as_int(text):
+    """把序列化对象字符串里的数值读成 int。空值 / 带引号 / 带单位的都容错。"""
+    if not text:
+        return 0
+    buf = []
+    for ch in str(text):
+        if ch.isdigit():
+            buf.append(ch)
+        elif ch in "+-" and not buf:
+            continue
+        elif buf:
+            break
+    try:
+        return int("".join(buf)) if buf else 0
+    except ValueError:
+        return 0
+
+
+
 # ───────────────────────── 识别 + 打开 ─────────────────────────
 
 _QCOW_SIG = b"QFI\xfb"
@@ -901,7 +1380,7 @@ def probe(path):
     """看一眼这是什么格式，返回 (kind, label)。不打开、不解析。
 
     kind 为 `raw` 表示「就是一段扁平字节流」（dd 镜像、任意数据）。
-    已知但**不支持**的格式也会如实返回（ex01 / l01 / qcow2 / vhd-differencing），
+    已知但**不支持**的格式也会如实返回（lx01 / l01 / qcow2 / vhd-differencing），
     这样调用方能给出「为什么读不了、怎么转」而不是「这不是文件系统」。
     """
     try:
@@ -926,7 +1405,9 @@ def probe(path):
     if head.startswith(_EWF_L01_SIG):
         return "l01", "L01 逻辑取证文件"
     if head.startswith(_EWF2_SIG):
-        return "ex01", "E01 第二版（Ex01）"
+        return "ex01", "Ex01 取证镜像"
+    if head.startswith(_EX01_LX_SIG):
+        return "lx01", "Lx01 逻辑取证文件"
     if head[:4] == _QCOW_SIG:
         return "qcow2", "QCOW2 镜像"
     if tail[:8] == _VHD_COOKIE:
@@ -949,9 +1430,10 @@ def source_size(path):
     """
     try:
         kind, _label = probe(path)
-        if kind == "e01":
+        if kind in ("e01", "ex01"):
             total = 0
-            for p in _ewf_segments(path):
+            finder = _ewf_segments if kind == "e01" else _ex01_segments
+            for p in finder(path):
                 try:
                     total += os.path.getsize(p)
                 except OSError:
@@ -981,7 +1463,9 @@ def open_path(path):
     if kind == "e01":
         return _EwfDisk(path)
     if kind == "ex01":
-        raise VDiskError(_E01_HINT)
+        return _Ex01Disk(path)
+    if kind == "lx01":
+        raise VDiskError(_EX01_LX01_HINT)
     if kind == "l01":
         raise VDiskError(_L01_HINT)
     if kind == "qcow2":
