@@ -635,6 +635,28 @@ def _shell_delete(paths):
     return True, ""
 
 
+def _profile_safe_cache(name_low):
+    """这个名字的目录，profile 的规则表已经认定「删了没影响」的缓存。
+
+    为什么要在删除侧再判一次：`SYSTEM_OWNED` 是**按名字全局兜底**的粗名单，
+    里面有 `downloaded installations`（InstallShield 把安装源解压到这儿，装完就没人用）、
+    `d3dscache`（着色器缓存）、`connecteddevicesplatform` 这类 ——
+    而 `profile.APPDATA_RULES` 明确把它们标成 `safe`。
+    两边不一致的后果用户已经撞上了：**扫描列出来说「安装包残留（安全）」，
+    点删除却回「命中系统目录白名单」**，可他拿资源管理器一删就删掉了。
+
+    判据只留一份（`profile.APPDATA_RULES` 的第三列 == "safe"），这里只转发。
+    注意 `temp` / `tmp` / `packages` / `microsoft` 这些在规则表里是 review / keep，
+    仍然拦着 —— Temp 目录本身永远不许删。
+    """
+    try:
+        from .profile import APPDATA_RULES
+    except Exception:                        # noqa: BLE001  循环导入等，宁可保守
+        return False
+    ent = APPDATA_RULES.get(name_low)
+    return bool(ent and len(ent) >= 3 and ent[2] == "safe")
+
+
 def trash_paths(paths, max_batch=50, allow_exact=None, allow_system_names=False):
     """把目录移到回收站（可撤销）。返回 (成功[(path, 说明)], 失败[(path, 原因)])。
 
@@ -658,7 +680,8 @@ def trash_paths(paths, max_batch=50, allow_exact=None, allow_system_names=False)
         if low not in exact and not any(low.startswith(r + "\\") for r in allowed):
             bad.append((p, "不在允许清理的根目录内"))
             continue
-        if os.path.basename(ap).lower() in SYSTEM_OWNED:
+        name_low = os.path.basename(ap).lower()
+        if name_low in SYSTEM_OWNED and not _profile_safe_cache(name_low):
             if not (allow_system_names and low in exact):
                 bad.append((p, "命中系统目录白名单"))
                 continue
@@ -760,9 +783,11 @@ def named_block_reason(path):
     if any(f.startswith(sysroot) for f in forms):
         return "Windows 自带的东西，请到「清理空间 → 系统盘瘦身」里处理"
 
-    if any(os.path.basename(f.replace("/", "\\")).lower() in SYSTEM_OWNED for f in forms):
+    names = {os.path.basename(f.replace("/", "\\")).lower() for f in forms}
+    blocked = {n for n in names if n in SYSTEM_OWNED and not _profile_safe_cache(n)}
+    if blocked:
         # 用「」而不是（）—— 这句会被拼进菜单项的括号里，避免括号套括号
-        return "系统自带目录「%s」，不能删" % os.path.basename(ap).lower()
+        return "系统自带目录「%s」，不能删" % sorted(blocked)[0]
     if any("$recycle.bin" in f for f in forms):
         return "回收站本身不能删"
     if any(any(w in f for w in HARD_BLOCK_WORDS) for f in forms):
