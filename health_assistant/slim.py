@@ -599,6 +599,25 @@ _ERR_TEXT = {
 }
 
 
+def _who_holds(path):
+    """谁占着这个文件（Restart Manager）。
+
+    只在**已经删失败**的那几条上问（每条几十毫秒）—— 用户看到
+    「正被别的程序占用」还是不知道该关哪个程序，把进程名说出来才有用。
+    """
+    try:
+        from . import filelock
+        rep = filelock.lockers(path) or {}
+    except Exception:                      # noqa: BLE001  RM 不可用就退回通用说法
+        return ""
+    out = []
+    for h in rep.get("holders") or []:
+        nm = h.get("name") or "?"
+        pid = h.get("pid")
+        out.append(f"{nm}（PID {pid}）" if pid else nm)
+    return "、".join(out[:2])
+
+
 def _why_stuck(path):
     """删除失败的真实原因。CreateFileW 要 DELETE 权限 + 独占共享，能开就说明能删。
 
@@ -635,6 +654,9 @@ def _why_stuck(path):
         if err == 5:
             return "没有权限（需要管理员，或文件被系统/管控软件保护）"
         if err == 32:
+            who = _who_holds(path)
+            if who:
+                return f"被 {who}占用着（关掉它再试，或重启后再清）"
             return "正被别的程序占用（关掉对应程序后重试）"
         return f"删不掉（Windows 错误 {err}：{_ERR_TEXT.get(err, '未知')}）"
     except Exception as exc:                       # 探测失败不影响主流程
