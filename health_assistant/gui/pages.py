@@ -2855,7 +2855,7 @@ class CleanPage(Page):
         bar.addWidget(QLabel("体积 ≥"))
         self.sp_min = QDoubleSpinBox()
         self.sp_min.setRange(0, 100000)
-        self.sp_min.setDecimals(0)
+        self.sp_min.setDecimals(1)          # 允许 0.1MB：Temp 里大量垃圾就是几十 KB
         self.sp_min.setSuffix(" MB")
         self.sp_min.setValue(10)
         self.sp_min.setFixedWidth(96)
@@ -2979,8 +2979,8 @@ class CleanPage(Page):
             if self.sp_old.value() == 0:
                 self.sp_old.setValue(int((self.cfg.get("cleanup", {}) or {})
                                          .get("slim_older", 60)))
-            if self.sp_min.value() < 10:
-                self.sp_min.setValue(10)
+            if self.sp_min.value() < 0.5:
+                self.sp_min.setValue(1)
             self.lb_state.setText("瘦身模式：断链快捷方式 / 崩溃转储 / Office 残留锁文件"
                                   "已预先勾上；临时文件和旧安装包请自己挑")
         else:

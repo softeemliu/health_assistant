@@ -347,6 +347,22 @@ def scan_temp(budget=8.0, min_mb=10.0):
             except OSError:
                 continue
     items.sort(key=lambda x: -x["size"])
+    if skip_n:
+        # 被阈值挡掉的那批聚成**一条**：以前只在悬浮提示里带一句「另有 N 个未列出」，
+        # 用户看到的是「Temp 里明明有东西，工具说没有」。实测本机 Temp 顶层 21375 个
+        # 条目里 21041 个小于 1MB（合计 885MB），全被 10MB 阈值挡在外面 —— 其中就有
+        # 用户来问的 BIT9E84.tmp。聚合成一条既不淹没列表，也不会让人误以为「干净了」。
+        items.append({
+            # path 故意给一段**不存在的文字**：这类条目不能真去删（两万多个文件逐个
+            # 移回收站要几十分钟，而且 Temp 目录本身绝不许删）。trash() 第一步就会判
+            # 「已经不存在」并跳过，白名单也因此不会被绕开。
+            "path": "（用户 Temp + 系统 Temp）", "name": f"Temp 里的零散小文件（{skip_n} 个）",
+            "size": skip_b, "files": skip_n, "idle_days": 0,
+            "category": "zombie", "kind": "temp_small",
+            "note": (f"合计 {skip_b / 1048576:.0f} MB，每个都小于 {min_mb:g}MB。"
+                     f"建议用 Windows「磁盘清理 / 存储感知」一次清掉（它直接删、更快）"),
+            "confidence": "low", "is_dir": False, "aggregate": True,
+        })
     return items, skip_n, skip_b
 
 
