@@ -292,12 +292,14 @@ def scan_crashdumps():
 
 # ─────────────────── Temp 内容 ───────────────────
 
-def scan_temp(budget=8.0, min_mb=10.0):
+def scan_temp(budget=8.0, min_mb=0.0):
     """Temp 目录的**内容**（一级条目按体积聚合），永远不列 Temp 目录本身。
 
-    单文件低于 min_mb 的不单独列 —— 实测本机 Temp 里有 1.4 万个散落小文件，
-    全列出来界面会卡死，而且用户也不会逐个去勾。这些小文件合计体积一并回报，
-    需要时把阈值调小即可看到。
+    `min_mb=0`（默认）表示**一个都不漏**：Temp 里每个文件、每个目录都列出来。
+    实测本机 Temp 顶层 21375 个条目 / 5.24 GB（最大 2.8GB，最小几十字节），
+    全列出来表格 2 万多行 —— 用户要的就是「我自己挑」，那就全给。
+    `min_mb > 0` 时低于它的一律并进一条「零散小文件」汇总项，体积照样进合计，
+    不会让人误以为「已经干净了」（以前只在悬浮提示里带一句，等于看不见）。
 
     返回 (items, skipped_count, skipped_bytes)
     """
@@ -368,7 +370,7 @@ def scan_temp(budget=8.0, min_mb=10.0):
 
 # ─────────────────── 旧安装包 ───────────────────
 
-def scan_old_installers(older_days=60, budget=6.0, min_mb=10.0):
+def scan_old_installers(older_days=60, budget=6.0, min_mb=0.0):
     items = []
     cut = older_days * 86400
     now = time.time()
@@ -516,7 +518,7 @@ def space_hogs(budget=6.0):
 
 # ─────────────────── 主扫描 ───────────────────
 
-def scan(kind="all", older_days=60, min_mb=10.0, budget=20.0):
+def scan(kind="all", older_days=60, min_mb=0.0, budget=20.0):
     """只读扫描。kind: zombie / userjunk / all。
 
     min_mb 只作用于 Temp 里的散落条目（目录型残留不受影响）。
@@ -639,7 +641,7 @@ def _why_stuck(path):
         return f"删不掉（探测原因时出错：{type(exc).__name__}）"
 
 
-def trash(paths, max_batch=500, batch_size=None):
+def trash(paths, max_batch=500, batch_size=None, progress=None):
     """把扫出来的条目移到回收站。返回 (成功[(path, 说明)], 失败[(path, 原因)])。
 
     每条都要过四道闸，任何一道不过就跳过、不删：
@@ -654,6 +656,9 @@ def trash(paths, max_batch=500, batch_size=None):
     目录权限不足，把后面 47 条本来能删的临时文件全连坐了，界面显示「失败 47 个」。
     逐条调用多花的是毫秒级开销，换来的是「一条坏的不影响其他」。
     batch_size 仅为兼容旧调用方保留，传了也不再用。
+
+    `progress(已处理, 总数)`：不放限制之后用户可以一次勾上万个文件，
+    逐个 SHFileOperation 要一两分钟 —— 没有进度反馈，界面看起来就是卡死。
     """
     ok_list, bad = [], []
     todo = []
@@ -679,7 +684,10 @@ def trash(paths, max_batch=500, batch_size=None):
     # 回收站状态只查一次开头，之后每轮把上一轮的结果当作「before」——
     # SHQueryRecycleBin 一次 27ms，逐条查两遍的话 200 项白等 10 秒。
     prev = _recycle_stats()
-    for ap in todo:
+    total = len(todo)
+    for idx, ap in enumerate(todo):
+        if progress and (idx % 10 == 0 or idx == total - 1):
+            progress(idx + 1, total)
         leftover._shell_delete([ap])
         cur = _recycle_stats()
         grew = None

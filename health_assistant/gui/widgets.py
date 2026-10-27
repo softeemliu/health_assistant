@@ -290,9 +290,11 @@ class CheckTable(DataTable):
     def _emit_counts(self):
         self.counts_changed.emit(len(self.checked_payloads()), self.rowCount())
 
-    def checked_payloads(self):
+    def checked_payloads(self, visible_only=False):
         out = []
         for r in range(self.rowCount()):
+            if visible_only and self.isRowHidden(r):
+                continue
             it = self.item(r, 0)
             if it is None or it.checkState() != Qt.Checked:
                 continue
@@ -349,12 +351,27 @@ class CheckTable(DataTable):
         if it is not None:
             it.setCheckState(Qt.Checked if on else Qt.Unchecked)
 
-    def set_all_checked(self, on):
+    def set_all_checked(self, on, visible_only=True):
+        """全选/全不选。
+
+        `visible_only=True`（默认）只动**当前看得见的行**：表格加了搜索过滤之后，
+        「全选」如果连被藏起来的行一起勾上，用户看到的是一条、实际清的是几万条 ——
+        这种「做了什么和看到的不一致」是最不能留的坑。没有过滤时它等价于全选。
+        """
         state = Qt.Checked if on else Qt.Unchecked
-        for r in range(self.rowCount()):
-            it = self.item(r, 0)
-            if it is not None:
-                it.setCheckState(state)
+        self.blockSignals(True)
+        self.setUpdatesEnabled(False)
+        try:
+            for r in range(self.rowCount()):
+                if visible_only and self.isRowHidden(r):
+                    continue
+                it = self.item(r, 0)
+                if it is not None:
+                    it.setCheckState(state)
+        finally:
+            self.setUpdatesEnabled(True)
+            self.blockSignals(False)
+        self._emit_counts()
 
 
 class Badge(QLabel):

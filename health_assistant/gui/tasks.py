@@ -329,7 +329,10 @@ class CleanRunTask(BaseTask):
             ok_list += o
             bad += b
         if self.slim_paths:
-            o, b = slim.trash(self.slim_paths, max_batch=max(1, len(self.slim_paths)))
+            o, b = slim.trash(
+                self.slim_paths, max_batch=max(1, len(self.slim_paths)),
+                progress=lambda i, n: self.progress.emit(
+                    i, n, f"正在移到回收站…（{i}/{n}）"))
             ok_list += o
             bad += b
         ledger = planclean.write_ledger(self.kind, ok_list, bad)

@@ -2857,7 +2857,7 @@ class CleanPage(Page):
         self.sp_min.setRange(0, 100000)
         self.sp_min.setDecimals(1)          # 允许 0.1MB：Temp 里大量垃圾就是几十 KB
         self.sp_min.setSuffix(" MB")
-        self.sp_min.setValue(10)
+        self.sp_min.setValue(0)             # 默认不限制体积：Temp 里连几十字节的也列出来
         self.sp_min.setFixedWidth(96)
         bar.addWidget(self.sp_min)
 
@@ -2874,6 +2874,17 @@ class CleanPage(Page):
         bar.addWidget(self.chk_repeat)
         self.chk_state = QCheckBox("含工具状态目录")
         bar.addWidget(self.chk_state)
+
+        bar.addSpacing(10)
+        bar.addWidget(QLabel("搜"))
+        self.ed_find = QLineEdit()
+        self.ed_find.setPlaceholderText("文件名 / 路径里的几个字…")
+        self.ed_find.setClearButtonEnabled(True)
+        self.ed_find.setFixedWidth(190)
+        self.ed_find.setToolTip("只筛表格里显示的行，不会改变扫描范围；"
+                                "筛选后「全选」也只勾选看到的这些行")
+        self.ed_find.textChanged.connect(self._apply_find)
+        bar.addWidget(self.ed_find)
 
         self.btn_scan = QPushButton("扫描")
         self.btn_scan.setObjectName("Primary")
@@ -2979,8 +2990,7 @@ class CleanPage(Page):
             if self.sp_old.value() == 0:
                 self.sp_old.setValue(int((self.cfg.get("cleanup", {}) or {})
                                          .get("slim_older", 60)))
-            if self.sp_min.value() < 0.5:
-                self.sp_min.setValue(1)
+            pass                            # 不再强行改「体积 ≥」：用户要看全部就给他全部
             self.lb_state.setText("瘦身模式：断链快捷方式 / 崩溃转储 / Office 残留锁文件"
                                   "已预先勾上；临时文件和旧安装包请自己挑")
         else:
@@ -3143,11 +3153,34 @@ class CleanPage(Page):
         dlg.changed.connect(self.scan)          # 删掉过就重扫，数字要对得上
         dlg.exec()
 
+    def _apply_find(self, text):
+        """按关键字筛表格行（路径 + 说明）。
+
+        不限制体积之后 Temp 一项就有 1.4 万行，没有搜索等于没列 ——
+        用户只知道文件名，得能直接找。这里只隐藏行，不动候选数据。
+        """
+        kw = (text or "").strip().lower()
+        t = self.table
+        t.setUpdatesEnabled(False)
+        try:
+            for r in range(t.rowCount()):
+                if not kw:
+                    t.setRowHidden(r, False)
+                    continue
+                path = t.item(r, 4)
+                note = t.item(r, 5)
+                hit = ((path is not None and kw in path.text().lower()) or
+                       (note is not None and kw in (note.text() or "").lower()))
+                t.setRowHidden(r, not hit)
+        finally:
+            t.setUpdatesEnabled(True)
+        self._on_counts(len(t.checked_payloads(visible_only=True)), t.rowCount())
+
     def _on_counts(self, n, total):
         self.btn_clean.setEnabled(n > 0)
         size = 0
         if self._plan:
-            picked = {c["path"] for c in self.table.checked_payloads()}
+            picked = {c["path"] for c in self.table.checked_payloads(visible_only=True)}
             size = sum(c["size"] for c in self._plan["cands"] if c["path"] in picked)
         self.btn_clean.setText(f"移到回收站（{n} 项" + (f" / {fb(size)}" if n else "") + "）")
 
@@ -3210,7 +3243,8 @@ class CleanPage(Page):
         if self.is_busy():
             self.notify.emit("正在忙（扫描或清理进行中），等这次做完再操作")
             return
-        picked = list(picked) if picked else self.table.checked_payloads()
+        picked = (list(picked) if picked
+                  else self.table.checked_payloads(visible_only=True))
         if not picked:
             return
         total = sum(c["size"] for c in picked)
@@ -3254,6 +3288,8 @@ class CleanPage(Page):
             allow_system_names=self.chk_state.isChecked(),
             slim_paths=slim_paths,
             parent=self))
+        task.progress.connect(
+            lambda _i, _n, msg: self.lb_state.setText(msg))
         task.failed.connect(self._on_run_fail)
         task.done.connect(self._on_done)
         task.start()
